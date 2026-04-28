@@ -1,0 +1,62 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Virtual Environments ---
+.venv/
+venv/
+ENV/
+env/
+
+# --- Project Specific ---
+data/*
+!data/.gitkeep
+outputs/*
+!outputs/.gitkeep
+pipeline_output.log
+.ruff_cache/
+.pytest_cache/
+.streamlit/
+! .streamlit/config.toml
+
+# --- GIS / Geospatial ---
+*.tif
+*.geotiff
+*.tiff
+*.shp
+*.dbf
+*.shx
+*.prj
+*.npy
+band_stats.npy
+
+# --- IDEs & OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# --- Logs & Temp ---
+*.log
+*.tmp
+.ipynb_checkpoints/

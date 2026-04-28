@@ -1,0 +1,46 @@
+[project]
+name = "landcover-segmentation"
+version = "0.1.0"
+description = "Multispectral land-cover semantic segmentation using Sentinel-2 and UNet"
+authors = [{ name = "[Your Name]" }]
+dependencies = [
+    "numpy",
+    "pandas",
+    "rasterio",
+    "geopandas",
+    "torch",
+    "torchvision",
+    "pytorch-lightning",
+    "segmentation-models-pytorch",
+    "albumentations",
+    "matplotlib",
+    "seaborn",
+    "pyyaml",
+    "earthengine-api",
+    "geemap",
+    "scikit-image",        # ✅ ADDED: skimage used in phase_postprocess
+    "scipy",               # ✅ ADDED: gaussian_filter in download_quickstart.py
+    "opencv-python",       # ✅ ADDED: cv2 used in dataset.py and augmentations.py
+    "streamlit",           # ✅ ADDED: entire dashboard (app.py)
+    "Pillow",              # ✅ ADDED: Image.open() in app.py
+    "torchmetrics",        # ✅ ADDED: JaccardIndex, Accuracy, F1Score in pipeline
+    "folium",              # ✅ FEATURE 4 - MAP: needed for rendering map
+    "streamlit-folium",    # ✅ FEATURE 4 - MAP: needed for integrating folium in streamlit
+    "transformers",        # ✅ FEATURE 5 - SEGFORMER: HuggingFace SegFormer model
+]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.black]
+line-length = 100
+
+[tool.pyright]
+include = ["src", "run_pipeline.py", "app.py"]
+extraPaths = [".", "src"]
+executionEnvironments = [
+    { root = "." }
+]
