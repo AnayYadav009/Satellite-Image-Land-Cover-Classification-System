@@ -2,7 +2,8 @@
 name = "landcover-segmentation"
 version = "0.1.0"
 description = "Multispectral land-cover semantic segmentation using Sentinel-2 and UNet"
-authors = [{ name = "[Your Name]" }]
+authors = [{ name = "Anay Yadav" }]
+urls = { Repository = "https://github.com/AnayYadav009/Satellite-Image-Land-Cover-Classification-System" }
 dependencies = [
     "numpy",
     "pandas",

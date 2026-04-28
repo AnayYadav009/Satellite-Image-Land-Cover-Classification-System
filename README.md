@@ -42,8 +42,8 @@ An advanced, production-ready geospatial machine learning pipeline for automated
 
 1. **Clone the Repository**:
    ```bash
-   git clone https://github.com/[YOUR_USERNAME]/[REPO_NAME].git
-   cd [REPO_NAME]
+   git clone https://github.com/AnayYadav009/Satellite-Image-Land-Cover-Classification-System.git
+   cd Satellite-Image-Land-Cover-Classification-System
    ```
 
 2. **Set up Virtual Environment**:
