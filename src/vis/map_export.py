@@ -1,5 +1,8 @@
 """
 Visualization utilities for creating interactive map overlays.
+
+Provides GeoTIFF reprojection, segmentation mask to RGBA conversion,
+and Folium map construction for Streamlit dashboard integration.
 """
 
 import folium
@@ -9,19 +12,19 @@ import rasterio.warp
 from PIL import Image
 
 
-# ✅ FEATURE 4 - MAP: Function to reproject a GeoTIFF to WGS84 for Leaflet map integration
 def reproject_to_wgs84(src_path: str, dst_path: str) -> None:
-    """Reprojects any GeoTIFF to EPSG:4326 using rasterio.warp.reproject.
-    Required so Leaflet (which uses WGS84) can position the overlay correctly."""
+    """Reproject a GeoTIFF to EPSG:4326 for Leaflet map integration.
+
+    Args:
+        src_path: Path to the source GeoTIFF.
+        dst_path: Path for the reprojected output GeoTIFF.
+    """
     try:
         with rasterio.open(src_path) as src:
             dst_crs = "EPSG:4326"
-
-            # Calculate transform and dimensions for the destination CRS
             transform, width, height = rasterio.warp.calculate_default_transform(
                 src.crs, dst_crs, src.width, src.height, *src.bounds
             )
-
             kwargs = src.meta.copy()
             kwargs.update(
                 {"crs": dst_crs, "transform": transform, "width": width, "height": height}
@@ -43,32 +46,35 @@ def reproject_to_wgs84(src_path: str, dst_path: str) -> None:
         raise
 
 
-# ✅ FEATURE 4 - MAP: Convert a segmentation mask to RGBA PNG and return WGS84 bounds
 def segmentation_mask_to_rgba_png(
     mask_path: str,
     output_png_path: str,
-    class_colors: list[str],  # hex strings, one per class
-    alpha: int = 180,  # 0-255 transparency of overlay
+    class_colors: list[str],
+    alpha: int = 180,
 ) -> tuple[float, float, float, float]:
-    """Converts a single-band uint8 segmentation GeoTIFF into an RGBA PNG
-    where each pixel is colored by its class. Returns (west, south, east, north)
-    bounds in WGS84 degrees for use as Leaflet ImageOverlay bounds."""
+    """Convert a segmentation GeoTIFF to an RGBA PNG overlay.
+
+    Args:
+        mask_path: Path to a single-band uint8 segmentation GeoTIFF.
+        output_png_path: Destination file path for the RGBA PNG.
+        class_colors: List of hex color strings, one per class.
+        alpha: Overlay transparency (0–255).
+
+    Returns:
+        Tuple of (west, south, east, north) bounds in WGS84 degrees.
+    """
     try:
         with rasterio.open(mask_path) as src:
             mask = src.read(1)
             bounds = src.bounds
-
-            # Calculate WGS84 bounds
             west, south, east, north = bounds.left, bounds.bottom, bounds.right, bounds.top
 
-        # Convert hex colors to RGB tuples
         def hex_to_rgb(hex_color):
             hex_color = hex_color.lstrip("#")
             return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
 
         rgb_colors = [hex_to_rgb(c) for c in class_colors]
 
-        # Create RGBA image
         h, w = mask.shape
         rgba = np.zeros((h, w, 4), dtype=np.uint8)
 
@@ -79,7 +85,6 @@ def segmentation_mask_to_rgba_png(
             rgba[class_pixels, 2] = color[2]
             rgba[class_pixels, 3] = alpha
 
-        # Save to PNG
         img = Image.fromarray(rgba)
         img.save(output_png_path)
 
@@ -89,27 +94,27 @@ def segmentation_mask_to_rgba_png(
         raise
 
 
-# ✅ FEATURE 4 - MAP: Build the Folium map with the image overlay
 def build_folium_map(
     rgba_png_path: str,
-    bounds: tuple[float, float, float, float],  # (west, south, east, north)
+    bounds: tuple[float, float, float, float],
     center: tuple[float, float] | None = None,
 ) -> folium.Map:
-    """Creates a folium.Map centered on the scene with:
-      - OpenStreetMap as base layer
-      - The RGBA PNG as a folium.raster_layers.ImageOverlay with the given bounds
-      - A folium.LayerControl so the overlay can be toggled
-    Returns the folium.Map object."""
+    """Create a Folium map with a segmentation overlay.
+
+    Args:
+        rgba_png_path: Path to the RGBA PNG overlay image.
+        bounds: Tuple of (west, south, east, north) in WGS84 degrees.
+        center: Optional (lat, lon) center for the map view.
+
+    Returns:
+        Configured folium.Map object with the overlay and layer control.
+    """
     try:
         west, south, east, north = bounds
-
         if center is None:
             center = [(south + north) / 2, (west + east) / 2]
 
         m = folium.Map(location=center, zoom_start=13, tiles="OpenStreetMap")
-
-        # Image bounds for Folium is [[lat_min, lon_min], [lat_max, lon_max]]
-        # Or in south, west, north, east order: [[south, west], [north, east]]
         folium_bounds = [[south, west], [north, east]]
 
         folium.raster_layers.ImageOverlay(
@@ -123,7 +128,6 @@ def build_folium_map(
         ).add_to(m)
 
         folium.LayerControl().add_to(m)
-
         return m
     except Exception as e:
         print(f"Error in build_folium_map: {e}")

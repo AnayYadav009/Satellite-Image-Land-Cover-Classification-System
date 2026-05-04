@@ -1,6 +1,13 @@
 """
-Master pipeline: generates data, trains UNet, evaluates, runs change detection.
-Fully self-contained — run with: python run_pipeline.py
+Master pipeline for the Satellite Image Land-Cover Classification System.
+
+This script coordinates data generation, model training (UNet and SegFormer),
+evaluation, change detection, and time-series analysis. It provides a
+command-line interface for running the full end-to-end workflow.
+
+Usage:
+    python run_pipeline.py --mode quickstart
+    python run_pipeline.py --mode gee --model segformer --fusion
 """
 
 import json
@@ -14,53 +21,62 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-# ── PyTorch 2.6 compatibility ─────────────────────────────────────────
-# PyTorch 2.6 changed torch.load to default weights_only=True, which
-# blocks numpy types (ndarray, dtype, etc.) during checkpoint loading.
-# Since all checkpoints are generated locally by our own code, we
-# safely default to weights_only=False to avoid deserialization errors.
+import numpy as np
+
+try:
+    import torch.serialization
+
+    torch.serialization.add_safe_globals(
+        [
+            np._core.multiarray._reconstruct,
+            np.dtype,
+            np.ndarray,
+            np.dtypes.Float32DType,
+            np.dtypes.Int64DType,
+        ]
+    )
+except (ImportError, AttributeError):
+    pass
+
 _orig_torch_load = torch.load
 
 
 def _patched_torch_load(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
+    """Wrapper for torch.load that defaults to weights_only=False."""
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
     return _orig_torch_load(*args, **kwargs)
 
 
 torch.load = _patched_torch_load
 
-matplotlib.use("Agg")  # non-interactive backend
-import matplotlib.patches as mpatches  # noqa: E402
-import matplotlib.pyplot as plt  # noqa: E402
-import pandas as pd  # noqa: E402
-import seaborn as sns  # noqa: E402
-from matplotlib.colors import ListedColormap  # noqa: E402
+matplotlib.use("Agg")
+import matplotlib.patches as mpatches
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+from matplotlib.colors import ListedColormap
 
-# ── ensure project root is on sys.path ────────────────────────────────
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-# ✅ FEATURE 4 - MAP: Fix PROJ_DATA to avoid conflicts with other GIS software
 if "PROJ_DATA" not in os.environ:
     proj_path = ROOT / ".venv" / "Lib" / "site-packages" / "rasterio" / "proj_data"
     if proj_path.exists():
         os.environ["PROJ_DATA"] = str(proj_path)
 
-# ── constants ─────────────────────────────────────────────────────────
-import pytorch_lightning as pl  # noqa: E402
-import segmentation_models_pytorch as smp  # noqa: E402
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint  # noqa: E402
-from torchmetrics import Accuracy, F1Score, JaccardIndex  # noqa: E402
+import pytorch_lightning as pl
+import segmentation_models_pytorch as smp
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from torchmetrics import Accuracy, F1Score, JaccardIndex
 
 try:
-    # --- Standard package-style imports (for CLI execution) ---
     from src.data.dataset import LandCoverDataset
     from src.data.download_ee import download_bhopal_dataset
     from src.data.download_quickstart import CLASS_NAMES, NUM_CLASSES, create_quickstart_dataset
     from src.data.raster_utils import save_segmentation_geotiff, stitch_patches
     from src.training.augmentations import get_train_transforms, get_val_transforms
 except (ImportError, ModuleNotFoundError):
-    # --- Fallback for IDEs that treat 'src' as the root directory ---
     sys.path.append(str(ROOT / "src"))
     from data.dataset import LandCoverDataset
     from data.download_ee import download_bhopal_dataset
@@ -68,28 +84,16 @@ except (ImportError, ModuleNotFoundError):
     from data.raster_utils import save_segmentation_geotiff, stitch_patches
     from training.augmentations import get_train_transforms, get_val_transforms
 
-# ── constants ─────────────────────────────────────────────────────────
-CLASS_COLORS = [
-    "#FF0000",
-    "#006400",
-    "#FFD700",
-    "#7CFC00",
-    "#D2B48C",
-    "#00CED1",
-    "#0000FF",
-    "#FFFFFF",
-    "#8B4513",
-    "#808080",
-]
+CLASS_COLORS = ["#FF0000","#006400","#FFD700","#7CFC00","#D2B48C","#00CED1","#0000FF","#FFFFFF","#8B4513","#808080"]
 SEED = 42
-PATCH_SIZE = 256  # ✅ UPDATED: Increased to 256 for better context
+PATCH_SIZE = 256
 NUM_BANDS = 16
-NUM_BANDS_FUSION = NUM_BANDS + 3  # ✅ FEATURE 3 - SAR: optical + VV + VH + VV/VH ratio
-BATCH_SIZE = 16  # Increased for better speed
-LR = 5e-4  # Peak LR for OneCycle
-MAX_EPOCHS = 25  # Accelerated convergence
+NUM_BANDS_FUSION = NUM_BANDS + 3
+BATCH_SIZE = 16
+LR = 5e-4
+MAX_EPOCHS = 25
 PATIENCE = 10
-ENCODER = "resnet34"  # Balanced speed/capacity
+ENCODER = "resnet34"
 DATA_DIR_QUICK = ROOT / "data" / "quickstart"
 DATA_DIR_GEE = ROOT / "data" / "real"
 OUT_DIR = ROOT / "outputs"
@@ -101,8 +105,8 @@ for d in [CKPT_DIR, MAP_DIR, REPORT_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 
-# ── reproducibility ──────────────────────────────────────────────────
 def seed_everything(seed: int = SEED):
+    """Set all random seeds for reproducible experiments."""
     import random
 
     random.seed(seed)
@@ -135,7 +139,6 @@ def visual_audit_dataset(data_dir, output_path):
         img = np.load(f_img)
         lbl = np.load(f_lbl)
 
-        # Stretch RGB (B4, B3, B2) for visualization
         rgb = img[[3, 2, 1]].transpose(1, 2, 0)
         rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
 
@@ -153,15 +156,12 @@ def visual_audit_dataset(data_dir, output_path):
     print(f"  Diagnostic visual audit saved to {output_path}")
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  PHASE 1 — DATA GENERATION
-# ══════════════════════════════════════════════════════════════════════
 def phase_data(mode="quickstart", gee_project=None):
+    """Phase 1: Generate or download the dataset and compute class distribution."""
     print("\n" + "=" * 70)
     if mode == "gee":
         print("  PHASE 1 -> Fetching REAL Sentinel-2 Data for Bhopal (GEE)")
         print("=" * 70)
-        # Optimized for speed/accuracy balance
         download_bhopal_dataset(
             output_dir=str(DATA_DIR_GEE), num_patches=150, project_id=gee_project
         )
@@ -179,7 +179,6 @@ def phase_data(mode="quickstart", gee_project=None):
         )
         data_dir = DATA_DIR_QUICK
 
-    # Print class distribution
     lbl_dir = data_dir / "train" / "labels"
     counts = np.zeros(NUM_CLASSES, dtype=np.int64)
     for f in sorted(lbl_dir.glob("*.npy")):
@@ -195,7 +194,6 @@ def phase_data(mode="quickstart", gee_project=None):
             pct = 100 * counts[i] / total
             print(f"    {i}: {name:<14s}  {counts[i]:>8d} px  ({pct:5.1f}%)")
 
-    # Run visual audit
     if (data_dir / "band_stats.npy").exists():
         visual_audit_dataset(data_dir, MAP_DIR / "dataset_audit.png")
     else:
@@ -207,35 +205,37 @@ def phase_data(mode="quickstart", gee_project=None):
     return counts, data_dir
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  PHASE 2 — MODEL + LIGHTNING MODULE
-# ══════════════════════════════════════════════════════════════════════
 class LandCoverModule(pl.LightningModule):
-    def __init__(
-        self, class_weights=None, in_channels=NUM_BANDS
-    ):  # ✅ FEATURE 5 - SEGFORMER: accept dynamic in_channels
+    """UNet-based semantic segmentation module with Focal + Dice loss."""
+
+    def __init__(self, class_weights=None, in_channels=NUM_BANDS):
+        """Initialize UNet model with combined Focal + Dice loss.
+
+        Args:
+            class_weights: Optional per-class weight array.
+            in_channels: Number of input bands.
+        """
         super().__init__()
-        # ✅ FIXED BUG 3 (part 1): save in_channels so load_from_checkpoint
-        #                          can restore it automatically
+        weights_list = (
+            class_weights.tolist() if isinstance(class_weights, np.ndarray) else class_weights
+        )
         self.save_hyperparameters(ignore=["class_weights"])
+        self.hparams.class_weights = weights_list
         self.model = smp.Unet(
             encoder_name=ENCODER,
             encoder_weights="imagenet",
-            in_channels=in_channels,  # ✅ FEATURE 5: dynamic channel count
+            in_channels=in_channels,
             classes=NUM_CLASSES,
             activation=None,
         )
-        # Combined CE + Dice loss
-        # Only compute Dice loss for classes that exist in the training data
-        # Focal Loss helps the model focus on "hard" pixels, speeding up accuracy gains
         self.ce_loss = smp.losses.FocalLoss(
             mode="multiclass", alpha=0.25, gamma=2.0, ignore_index=9
         )
+        
         if class_weights is not None:
-            # Exclude index 9 (Clouds/Background) from Dice calculation
             valid_classes = [i for i, w in enumerate(class_weights) if w > 0.0 and i != 9]
             self.dice_loss = smp.losses.DiceLoss(
-                mode="multiclass", from_logits=True, classes=valid_classes
+                mode="multiclass", from_logits=True, classes=valid_classes, ignore_index=9
             )
         else:
             self.dice_loss = smp.losses.DiceLoss(
@@ -247,13 +247,14 @@ class LandCoverModule(pl.LightningModule):
         self.val_f1 = F1Score(task="multiclass", num_classes=NUM_CLASSES, average="macro")
 
     def forward(self, x):
+        """Forward pass through the UNet encoder-decoder."""
         return self.model(x)
 
     def _shared_step(self, batch):
+        """Shared forward and loss computation for train/val steps."""
         x, y = batch
         logits = self(x)
 
-        # Combined Loss: 0.5 * FocalLoss + 0.5 * DiceLoss  # ✅ FIXED
         ce_loss = self.ce_loss(logits, y)
         dice_loss = self.dice_loss(logits, y)
         loss = 0.5 * ce_loss + 0.5 * dice_loss
@@ -262,28 +263,30 @@ class LandCoverModule(pl.LightningModule):
         return loss, preds, y
 
     def training_step(self, batch, batch_idx):
+        """Compute training loss and log."""
         loss, _, _ = self._shared_step(batch)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        # CosineAnnealingLR for stable convergence without depending on loader length
+        """Configure AdamW optimizer with CosineAnnealingLR scheduler."""
         optimizer = torch.optim.AdamW(self.parameters(), lr=LR, weight_decay=1e-4)
 
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=MAX_EPOCHS,
-            eta_min=1e-6,  # ✅ FIXED: Replace OneCycleLR with epoch-based CosineAnnealingLR
+            eta_min=1e-6,
         )
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
                 "interval": "epoch",
-            },  # ✅ FIXED: Set interval to epoch
+            },
         }
 
     def validation_step(self, batch, batch_idx):
+        """Compute validation loss, update metrics, and log."""
         loss, preds, y = self._shared_step(batch)
         self.val_iou(preds, y)
         self.val_acc(preds, y)
@@ -295,19 +298,14 @@ class LandCoverModule(pl.LightningModule):
         return loss
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  PHASE 3 — TRAINING
-# ══════════════════════════════════════════════════════════════════════
 def phase_train(class_counts, data_dir, fusion=False):
+    """Phase 2: Train a UNet model with the given class distribution."""
     print("\n" + "=" * 70)
-    print(
-        f"  PHASE 2 -> Training Baseline UNet ({ENCODER.capitalize()} encoder)"
-    )  # ✅ FIXED: Use ENCODER constant instead of hardcoded string
+    print(f"  PHASE 2 -> Training Baseline UNet ({ENCODER.capitalize()} encoder)")
     print("=" * 70)
     seed_everything()
     stats_path = data_dir / "band_stats.npy"
 
-    # ✅ FIXED: Use FusionDataset when fusion=True
     if fusion:
         try:
             from src.data.fusion_dataset import FusionDataset
@@ -339,15 +337,13 @@ def phase_train(class_counts, data_dir, fusion=False):
         val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False
     )
 
-    # Class weights (smoothed inverse frequency)
     total = class_counts.sum()
     freq = class_counts.astype(np.float64) / (total + 1e-8)
     weights = 1.0 / (freq + 0.05)
-    weights[class_counts == 0] = 0.0  # Zero weight for empty classes
+    weights[class_counts == 0] = 0.0
     weights = np.clip(weights / (weights[weights > 0].mean() + 1e-8), 0.2, 3.0).astype(np.float32)
     print(f"  Class weights: {np.round(weights, 2).tolist()}")
 
-    # ✅ FIXED: Pass in_channels to LandCoverModule
     model = LandCoverModule(class_weights=weights, in_channels=in_channels)
 
     checkpoint_cb = ModelCheckpoint(
@@ -359,7 +355,6 @@ def phase_train(class_counts, data_dir, fusion=False):
         verbose=True,
     )
     early_stop_cb = EarlyStopping(monitor="val_loss", patience=PATIENCE, mode="min", verbose=True)
-    # ✅ ADDED: LR Monitor to track scheduler performance
     lr_monitor = pl.callbacks.LearningRateMonitor(logging_interval="epoch")
 
     trainer = pl.Trainer(
@@ -376,12 +371,14 @@ def phase_train(class_counts, data_dir, fusion=False):
         trainer.fit(model, train_loader, val_loader)
     except Exception as e:
         print(f"\n  Warning: Trainer.fit encountered an error: {e}")
+        import traceback
+
+        traceback.print_exc()
         print("  Attempting to proceed with evaluation using existing checkpoints...")
 
     elapsed = time.time() - t0
     print(f"\n  Training phase took {elapsed / 60:.1f} minutes")
 
-    # Robustly find best model path
     best_path = checkpoint_cb.best_model_path
     if not best_path or not Path(best_path).exists():
         ckpts = list(CKPT_DIR.glob("*.ckpt"))
@@ -395,28 +392,23 @@ def phase_train(class_counts, data_dir, fusion=False):
     return best_path
 
 
-# ✅ FIXED WARNING 1: accept in_channels so fusion checkpoints load
-#                     with the correct first conv layer shape
 def load_model_for_inference(ckpt_path, model_name="unet", in_channels=NUM_BANDS):
+    """Load a trained model from checkpoint for inference."""
     if model_name == "segformer":
         try:
             from src.models.segformer_module import SegFormerModule
         except (ImportError, ModuleNotFoundError):
             from models.segformer_module import SegFormerModule
-        model = SegFormerModule.load_from_checkpoint(ckpt_path, strict=False)
+        model = SegFormerModule.load_from_checkpoint(ckpt_path, num_bands=in_channels, strict=False)
     else:
-        model = LandCoverModule.load_from_checkpoint(
-            ckpt_path, in_channels=in_channels, strict=False
-        )
+        model = LandCoverModule.load_from_checkpoint(ckpt_path, in_channels=in_channels, strict=False)
     model.eval()
     model.freeze()
     return model
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  PHASE 4 — EVALUATION
-# ══════════════════════════════════════════════════════════════════════
 def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
+    """Phase 3: Evaluate the trained model and generate diagnostic plots."""
     print("\n" + "=" * 70)
     print("  PHASE 3 -> Evaluation & Error Analysis")
     print("=" * 70)
@@ -439,11 +431,9 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
     )
     test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
 
-    # ✅ FIXED WARNING 1: pass correct channel count for fusion mode
     _in_ch = NUM_BANDS_FUSION if fusion else NUM_BANDS
     model = load_model_for_inference(best_ckpt, model_name=model_name, in_channels=_in_ch)
 
-    # Compute metrics
     iou_metric = JaccardIndex(task="multiclass", num_classes=NUM_CLASSES, average="none")
     acc_metric = Accuracy(task="multiclass", num_classes=NUM_CLASSES)
     f1_metric = F1Score(task="multiclass", num_classes=NUM_CLASSES, average="none")
@@ -451,7 +441,6 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
     confusion = torch.zeros(NUM_CLASSES, NUM_CLASSES, dtype=torch.long)
     all_preds, all_labels = [], []
 
-    # ✅ FEATURE 2 - CONFIDENCE: Imports and initialization
     try:
         from src.eval.uncertainty import compute_confidence_map, mc_dropout_uncertainty
     except (ImportError, ModuleNotFoundError):
@@ -465,13 +454,11 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
             iou_metric.update(preds, y)
             acc_metric.update(preds, y)
             f1_metric.update(preds, y)
-            # Confusion matrix
             for p, t in zip(preds.view(-1), y.view(-1)):
                 confusion[t, p] += 1
             all_preds.append(preds)
             all_labels.append(y)
 
-            # ✅ FEATURE 2 - CONFIDENCE: Accumulate confidence for whole test set
             for i in range(logits.shape[0]):
                 conf_map = compute_confidence_map(logits[i : i + 1])
                 all_conf_means.append(conf_map.mean())
@@ -481,7 +468,6 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
     per_class_f1 = f1_metric.compute().numpy()
     mean_iou = per_class_iou.mean()
 
-    # ✅ FEATURE 2 - CONFIDENCE: Mean confidence
     mean_conf_across_test_set = np.mean(all_conf_means)
 
     print(f"\n  Overall Accuracy : {overall_acc * 100:.2f}%")
@@ -492,7 +478,6 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
     for i, name in enumerate(CLASS_NAMES):
         print(f"  {name:<14s}  {per_class_iou[i] * 100:5.1f}%  {per_class_f1[i] * 100:5.1f}%")
 
-    # ── Confusion matrix plot ─────────────────────────────────────────
     conf_norm = confusion.float() / (confusion.sum(dim=1, keepdim=True) + 1e-8)
     fig, ax = plt.subplots(figsize=(10, 8))
     sns.heatmap(
@@ -512,10 +497,8 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
     plt.close(fig)
     print(f"\n  Confusion matrix saved to {MAP_DIR / 'confusion_matrix.png'}")
 
-    # ── Sample segmentation map ───────────────────────────────────────
     _plot_sample_predictions(model, test_ds)
 
-    # ✅ FEATURE 2 - CONFIDENCE: MC Dropout Uncertainty Analysis
     try:
         n_mc = 4
         print(f"\n  Running MC Dropout Uncertainty for first {n_mc} samples...")
@@ -527,19 +510,16 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
             mean_pred, uncertainty = mc_dropout_uncertainty(model, img.unsqueeze(0), n_passes=20)
             mc_uncertainties.append(uncertainty.mean())
 
-            # RGB
             rgb = img[[3, 2, 1]].numpy().transpose(1, 2, 0)
             rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
             axes[i, 0].imshow(rgb)
             axes[i, 0].set_title("RGB")
             axes[i, 0].axis("off")
 
-            # Prediction
             axes[i, 1].imshow(mean_pred, cmap=ListedColormap(CLASS_COLORS), vmin=0, vmax=9)
             axes[i, 1].set_title("Mean Prediction (MC)")
             axes[i, 1].axis("off")
 
-            # Uncertainty
             im_u = axes[i, 2].imshow(uncertainty, cmap="inferno", vmin=0, vmax=1)
             axes[i, 2].set_title("Entropy Uncertainty")
             axes[i, 2].axis("off")
@@ -554,11 +534,10 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
     except Exception as e:
         print(f"  Warning: MC Dropout evaluation failed: {e}")
 
-    # ── Save metrics JSON ─────────────────────────────────────────────
     metrics = {
         "overall_accuracy": round(float(overall_acc), 4),
         "mean_iou": round(float(mean_iou), 4),
-        "mean_confidence": round(float(mean_conf_across_test_set), 4),  # ✅ FEATURE 2
+        "mean_confidence": round(float(mean_conf_across_test_set), 4),
         "per_class_iou": {
             CLASS_NAMES[i]: round(float(per_class_iou[i]), 4) for i in range(NUM_CLASSES)
         },
@@ -575,7 +554,6 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
 
 def _plot_sample_predictions(model, dataset, n_samples=4):
     """Plot a grid of RGB | Ground Truth | Prediction | Confidence."""
-    # ✅ FEATURE 2 - CONFIDENCE: Import utility
     try:
         from src.eval.uncertainty import compute_confidence_map
     except (ImportError, ModuleNotFoundError):
@@ -595,7 +573,6 @@ def _plot_sample_predictions(model, dataset, n_samples=4):
 
         label = label.numpy()
 
-        # Create pseudo-RGB from bands 3, 2, 1 (R, G, B)
         rgb = img[[3, 2, 1]].numpy().transpose(1, 2, 0)
         rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
 
@@ -611,13 +588,11 @@ def _plot_sample_predictions(model, dataset, n_samples=4):
         axes[i, 2].set_title("Prediction")
         axes[i, 2].axis("off")
 
-        # ✅ FEATURE 2 - CONFIDENCE: 4th column for confidence heatmap
         im_conf = axes[i, 3].imshow(conf_map, cmap="RdYlGn", vmin=0, vmax=1)
         axes[i, 3].set_title("Confidence")
         axes[i, 3].axis("off")
         plt.colorbar(im_conf, ax=axes[i, 3], fraction=0.046, pad=0.04)
 
-    # Legend
     patches = [
         mpatches.Patch(color=CLASS_COLORS[i], label=CLASS_NAMES[i]) for i in range(NUM_CLASSES)
     ]
@@ -628,10 +603,8 @@ def _plot_sample_predictions(model, dataset, n_samples=4):
     print(f"  Sample predictions saved to {MAP_DIR / 'sample_predictions.png'}")
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  PHASE 5 — POST-PROCESSING
-# ══════════════════════════════════════════════════════════════════════
 def phase_postprocess(best_ckpt, data_dir, fusion=False, model_name="unet"):
+    """Phase 4: Apply morphological cleanup and measure mIoU improvement."""
     print("\n" + "=" * 70)
     print("  PHASE 4 -> Post-Processing (Morphological Cleanup)")
     print("=" * 70)
@@ -653,7 +626,6 @@ def phase_postprocess(best_ckpt, data_dir, fusion=False, model_name="unet"):
         stats_path=stats_path,
     )
 
-    # ✅ FIXED WARNING 1: pass correct channel count for fusion mode
     _in_ch = NUM_BANDS_FUSION if fusion else NUM_BANDS
     model = load_model_for_inference(best_ckpt, model_name=model_name, in_channels=_in_ch)
 
@@ -667,19 +639,16 @@ def phase_postprocess(best_ckpt, data_dir, fusion=False, model_name="unet"):
 
         iou_raw.update(pred_raw.unsqueeze(0), label.unsqueeze(0))
 
-        # Post-process each class mask
         pred_np = pred_raw.numpy().astype(np.int64)
         cleaned = np.zeros_like(pred_np)
         for c in range(NUM_CLASSES):
             mask = (pred_np == c).astype(np.uint8)
             mask = opening(mask, selem)
             mask = closing(mask, selem)
-            # Remove tiny regions
             mask_bool = mask.astype(bool)
             mask_bool = remove_small_objects(mask_bool, min_size=50)
             cleaned[mask_bool] = c
 
-        # Fill any zero-gaps with raw prediction
         unset = cleaned == 0
         if unset.any():
             cleaned[unset] = pred_np[unset]
@@ -697,21 +666,15 @@ def phase_postprocess(best_ckpt, data_dir, fusion=False, model_name="unet"):
     return {"raw_miou": raw_val, "post_miou": post_val, "delta": delta}
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  PHASE 6 — PATCH STITCHING & GEOTIFF
-# ══════════════════════════════════════════════════════════════════════
 def phase_stitch(best_ckpt, data_dir, fusion=False, model_name="unet"):
-    """✅ ADDED: Phase to reassemble patches into a full scene and save as GeoTIFF."""
+    """Phase 6: Reassemble predicted test patches into a full scene."""
     print("\n" + "=" * 70)
     print("  PHASE 6 -> Patch Stitching & Scene Reassembly")
     print("=" * 70)
 
-    # Load model
-    # ✅ FIXED WARNING 1: pass correct channel count for fusion mode
     _in_ch = NUM_BANDS_FUSION if fusion else NUM_BANDS
     model = load_model_for_inference(best_ckpt, model_name=model_name, in_channels=_in_ch)
 
-    # Load test set
     if fusion:
         try:
             from src.data.fusion_dataset import FusionDataset
@@ -727,7 +690,6 @@ def phase_stitch(best_ckpt, data_dir, fusion=False, model_name="unet"):
         stats_path=data_dir / "band_stats.npy",
     )
 
-    # Collect predictions
     preds = []
     for i in range(len(test_ds)):
         img, _ = test_ds[i]
@@ -735,13 +697,11 @@ def phase_stitch(best_ckpt, data_dir, fusion=False, model_name="unet"):
             out = model(img.unsqueeze(0)).argmax(dim=1).squeeze().numpy()
             preds.append(out)
 
-    # Load original scene shape
     shape_file = data_dir / "test" / "scene_shape.npy"
     if shape_file.exists():
         H, W = np.load(shape_file)
         full_mask = stitch_patches(preds, (H, W), patch_size=PATCH_SIZE)
 
-        # Save as PNG for dashboard
         plt.imsave(
             MAP_DIR / "full_stitched_scene.png",
             full_mask,
@@ -751,9 +711,7 @@ def phase_stitch(best_ckpt, data_dir, fusion=False, model_name="unet"):
         )
         print(f"  Stitched scene saved to {MAP_DIR / 'full_stitched_scene.png'}")
 
-        # ✅ FEATURE 4 - MAP: Reproject, create RGBA overlay, save bounds
         try:
-            # Attempt to save a sample GeoTIFF (mock profile if real one doesn't exist)
             from rasterio.transform import from_origin
 
             mock_profile = {
@@ -779,13 +737,10 @@ def phase_stitch(best_ckpt, data_dir, fusion=False, model_name="unet"):
             overlay_png = str(MAP_DIR / "segmentation_overlay.png")
             bounds_json = str(REPORT_DIR / "map_bounds.json")
 
-            # 1. Reproject to WGS84
             reproject_to_wgs84(orig_tif, wgs84_tif)
 
-            # 2. Convert to RGBA PNG
             bounds = segmentation_mask_to_rgba_png(wgs84_tif, overlay_png, CLASS_COLORS, alpha=180)
 
-            # 3. Save bounds
             with open(bounds_json, "w") as f:
                 json.dump(bounds, f)
 
@@ -804,6 +759,7 @@ def phase_stitch(best_ckpt, data_dir, fusion=False, model_name="unet"):
 
 
 def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False, model_name="unet"):
+    """Phase 5: Simulate bi-temporal change detection between two patches."""
     print("\n" + "=" * 70)
     print("  PHASE 5 -> Change Detection (T1 vs T2 Simulation)")
     print("=" * 70)
@@ -819,21 +775,16 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
         except (ImportError, ModuleNotFoundError):
             from data.download_quickstart import generate_synthetic_patch as generate_patch
 
-    model = load_model_for_inference(best_ckpt, model_name=model_name)
+    _in_ch = NUM_BANDS_FUSION if fusion else NUM_BANDS
+    model = load_model_for_inference(best_ckpt, model_name=model_name, in_channels=_in_ch)
 
     stats = np.load(data_dir / "band_stats.npy")
     means = stats[0].astype(np.float32).reshape(-1, 1, 1)
     stds = stats[1].astype(np.float32).reshape(-1, 1, 1)
 
-    # Generate two "timestamps" for the same AOI
-    img_t1, label_t1 = (
-        generate_patch(23.18, 77.41) if mode == "gee" else generate_patch(size=256, seed=1000)
-    )
-    img_t2, label_t2 = (
-        generate_patch(23.25, 77.48) if mode == "gee" else generate_patch(size=256, seed=2000)
-    )
+    img_t1, label_t1 = (generate_patch(23.18, 77.41) if mode == "gee" else generate_patch(size=256, seed=1000))
+    img_t2, label_t2 = (generate_patch(23.25, 77.48) if mode == "gee" else generate_patch(size=256, seed=2000))
 
-    # ✅ FIXED: Apply fusion dataset transformation to raw patches if active
     if fusion:
         try:
             from src.data.download_sar import generate_sar_for_patch
@@ -844,9 +795,7 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
         img_t1 = torch.cat([torch.from_numpy(img_t1), sar_t1], dim=0).numpy()
         img_t2 = torch.cat([torch.from_numpy(img_t2), sar_t2], dim=0).numpy()
 
-    # Normalise and predict
     def predict(img_np):
-        # ✅ FIXED: Only normalize optical bands (first NUM_BANDS channels)
         optical_norm = (img_np[:NUM_BANDS] - means) / (stds + 1e-8)
         if fusion:
             img_norm = np.concatenate([optical_norm, img_np[NUM_BANDS:]], axis=0)
@@ -861,7 +810,6 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
     pred_t1 = predict(img_t1)
     pred_t2 = predict(img_t2)
 
-    # Binary change map
     change_map = (pred_t1 != pred_t2).astype(np.uint8)
     total_pixels = change_map.size
     changed_pixels = change_map.sum()
@@ -870,16 +818,13 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
         f"({100 * changed_pixels / total_pixels:.1f}%)"
     )
 
-    # Transition matrix
     transition = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
     for c1 in range(NUM_CLASSES):
         for c2 in range(NUM_CLASSES):
             transition[c1, c2] = ((pred_t1 == c1) & (pred_t2 == c2)).sum()
 
-    # Area in hectares (10m resolution → 100 m²/pixel → 0.01 ha/pixel)
     area_ha = transition * 0.01
 
-    # Top transitions (off-diagonal)
     changes = []
     for i in range(NUM_CLASSES):
         for j in range(NUM_CLASSES):
@@ -893,7 +838,6 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
     for frm, to, px, ha in changes[:10]:
         print(f"  {frm:<14s} -> {to:<14s}  {px:>8,}  {ha:>10.1f}")
 
-    # Key transitions of policy interest
     print("\n  Key Transitions:")
     key_pairs = [
         (1, 2, "Deforestation (Forest -> Cropland)"),
@@ -906,7 +850,6 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
         ha = area_ha[c1, c2]
         print(f"    {desc}: {px:,} px ({ha:.1f} ha)")
 
-    # ── Plots ─────────────────────────────────────────────────────────
     cmap = ListedColormap(CLASS_COLORS)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
@@ -919,15 +862,12 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
     axes[2].imshow(change_map, cmap="RdYlGn_r", vmin=0, vmax=1)
     axes[2].set_title(f"Change Map ({100 * changed_pixels / total_pixels:.1f}% changed)")
     axes[2].axis("off")
-    patches = [
-        mpatches.Patch(color=CLASS_COLORS[i], label=CLASS_NAMES[i]) for i in range(NUM_CLASSES)
-    ]
+    patches = [mpatches.Patch(color=CLASS_COLORS[i], label=CLASS_NAMES[i]) for i in range(NUM_CLASSES)]
     fig.legend(handles=patches, loc="lower center", ncol=5, fontsize=8)
     plt.tight_layout(rect=[0, 0.06, 1, 1])
     fig.savefig(MAP_DIR / "change_detection_maps.png", dpi=150)
     plt.close(fig)
 
-    # Transition heatmap
     fig, ax = plt.subplots(figsize=(10, 8))
     df = pd.DataFrame(transition, index=CLASS_NAMES, columns=CLASS_NAMES)
     sns.heatmap(df, annot=True, fmt="d", cmap="YlOrRd", ax=ax)
@@ -938,13 +878,11 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
     fig.savefig(MAP_DIR / "transition_matrix.png", dpi=150)
     plt.close(fig)
 
-    # Save CSV
     df.to_csv(REPORT_DIR / "transition_matrix.csv")
     area_df = pd.DataFrame(area_ha, index=CLASS_NAMES, columns=CLASS_NAMES)
     area_df.to_csv(REPORT_DIR / "transition_area_ha.csv")
 
 
-# ✅ FEATURE 1 - TIMESERIES: New phase for NDVI monitoring
 def phase_timeseries(data_dir: Path):
     """Runs the NDVI time-series analysis pipeline."""
     print("\n" + "=" * 70)
@@ -969,43 +907,24 @@ def phase_timeseries(data_dir: Path):
                 save_ndvi_animation_frames,
             )
 
-        MONTH_NAMES = [
-            "Jan",
-            "Feb",
-            "Mar",
-            "Apr",
-            "May",
-            "Jun",
-            "Jul",
-            "Aug",
-            "Sep",
-            "Oct",
-            "Nov",
-            "Dec",
-        ]
+        MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
         TS_DIR = MAP_DIR / "timeseries"
         TS_DIR.mkdir(exist_ok=True)
 
-        # 1. Call generate_monthly_ndvi_series() — save result as REPORT_DIR / "ndvi_series.npy"
         ndvi_series = generate_monthly_ndvi_series(region_seed=42)
         np.save(REPORT_DIR / "ndvi_series.npy", ndvi_series)
 
-        # 2. Call detect_ndvi_anomalies() — save result as MAP_DIR / "ndvi_anomaly_map.png"
         anomaly_map = detect_ndvi_anomalies(ndvi_series)
         plt.imsave(MAP_DIR / "ndvi_anomaly_map.png", anomaly_map, cmap="hot_r")
 
-        # 3. Call save_ndvi_animation_frames() into TS_DIR
         save_ndvi_animation_frames(ndvi_series, str(TS_DIR), MONTH_NAMES)
 
-        # 4. Call compute_ndvi_stats() — save as REPORT_DIR / "ndvi_stats.json"
         stats = compute_ndvi_stats(ndvi_series)
         with open(REPORT_DIR / "ndvi_stats.json", "w") as f:
             json.dump(stats, f, indent=2)
 
-        # 5. Call plot_ndvi_curve() — save as MAP_DIR / "ndvi_curve.png"
         plot_ndvi_curve(stats, MONTH_NAMES, str(MAP_DIR / "ndvi_curve.png"))
 
-        # 6. Print: peak month name, trough month name, % anomalous pixels
         print(f"  Peak NDVI Month    : {MONTH_NAMES[stats['peak_month']]}")
         print(f"  Trough NDVI Month  : {MONTH_NAMES[stats['trough_month']]}")
         print(f"  Anomalous Pixels   : {stats['pct_anomalous']:.2f}%")
@@ -1014,8 +933,7 @@ def phase_timeseries(data_dir: Path):
         print(f"  Warning: NDVI Time-Series phase failed: {e}")
 
 
-# ✅ FEATURE 3 - SAR: Fusion comparison phase
-def phase_fusion_comparison(class_counts, data_dir):
+def phase_fusion_comparison(class_counts, data_dir, model_name="unet", main_result=None):
     """
     Trains and evaluates optical-only and fusion (optical+SAR) models,
     then saves comparison plot and results JSON.
@@ -1023,6 +941,7 @@ def phase_fusion_comparison(class_counts, data_dir):
     Args:
         class_counts: Per-class pixel counts from training data.
         data_dir: Path to the dataset directory.
+        model_name: Architecture to use for the benchmark.
 
     Returns:
         Tuple of (best_ckpt_optical, best_ckpt_fusion, fusion_results_dict).
@@ -1038,12 +957,14 @@ def phase_fusion_comparison(class_counts, data_dir):
             from models.benchmark import run_benchmark
 
         results = []
+        if main_result:
+            results.append(main_result)
+
         best_ckpts = {}
 
-        # ✅ FEATURE 3 - SAR: Train optical-only model
         print("\n  [Fusion] Training OPTICAL-ONLY model...")
         result_optical = run_benchmark(
-            model_name="unet",
+            model_name=model_name,
             class_counts=class_counts,
             data_dir=data_dir,
             out_dir=OUT_DIR,
@@ -1062,10 +983,9 @@ def phase_fusion_comparison(class_counts, data_dir):
         results.append(result_optical)
         best_ckpts["optical"] = result_optical["best_ckpt"]
 
-        # ✅ FEATURE 3 - SAR: Train fusion model (optical + SAR)
         print("\n  [Fusion] Training FUSION (Optical + SAR) model...")
         result_fusion = run_benchmark(
-            model_name="unet",
+            model_name=model_name,
             class_counts=class_counts,
             data_dir=data_dir,
             out_dir=OUT_DIR,
@@ -1085,10 +1005,8 @@ def phase_fusion_comparison(class_counts, data_dir):
         results.append(result_fusion)
         best_ckpts["fusion"] = result_fusion["best_ckpt"]
 
-        # ✅ FEATURE 3 - SAR: Save comparison plot (same format as benchmark)
         _save_fusion_comparison_plot(results, CLASS_NAMES)
 
-        # ✅ FEATURE 3 - SAR: Save results JSON
         try:
             import json as _json
 
@@ -1114,44 +1032,41 @@ def _save_fusion_comparison_plot(results, class_names):
         class_names: List of class name strings.
     """
     try:
-        fig, ax = plt.subplots(figsize=(12, 6))
-
+        fig, ax = plt.subplots(figsize=(14, 7))
         n_classes = len(class_names)
+        n_models = len(results)
         x = np.arange(n_classes)
-        bar_width = 0.35
-        colors = ["#1976D2", "#43A047"]  # ✅ FEATURE 3 - SAR: blue for optical, green for fusion
+        bar_width = 0.8 / n_models
+        colors = ["#1976D2", "#43A047", "#E64A19", "#7B1FA2", "#FBC02D"]
 
         for idx, result in enumerate(results):
-            iou_values = [result["per_class_iou"].get(name, 0.0) * 100 for name in class_names]
+            per_class = result.get("per_class_iou", [])
+            if isinstance(per_class, dict):
+                iou_values = [per_class.get(name, 0.0) * 100 for name in class_names]
+            elif isinstance(per_class, (list, np.ndarray)):
+                iou_values = [per_class[i] * 100 if i < len(per_class) else 0.0 for i in range(n_classes)]
+            else:
+                iou_values = [0.0] * n_classes
+
             label = f"{result['model']} (mIoU: {result['mean_iou'] * 100:.1f}%)"
             ax.bar(
-                x + idx * bar_width,
+                x + (idx - n_models / 2 + 0.5) * bar_width,
                 iou_values,
                 bar_width,
                 label=label,
-                color=colors[idx % 2],
+                color=colors[idx % len(colors)],
                 alpha=0.85,
             )
-            ax.axhline(
-                y=result["mean_iou"] * 100,
-                color=colors[idx % 2],
-                linestyle="--",
-                alpha=0.5,
-                linewidth=1,
-            )
 
-        short_names = [name[:6] for name in class_names]
-        ax.set_xticks(x + bar_width / 2)
-        ax.set_xticklabels(short_names, rotation=45, ha="right", fontsize=9)
-        ax.set_ylabel("IoU (%)")
+        ax.set_ylabel("Intersection over Union (IoU) %")
+        ax.set_title("Model Performance Comparison (Per Class)", fontsize=14, fontweight="bold")
+        ax.set_xticks(x)
+        ax.set_xticklabels(class_names, rotation=45, ha="right")
         ax.set_ylim(0, 100)
-        ax.set_title(
-            "Optical-Only vs SAR+Optical Fusion: Per-Class IoU", fontsize=13, fontweight="bold"
-        )
-        ax.legend(loc="upper right", fontsize=9)
-        ax.grid(axis="y", alpha=0.3)
-
+        ax.legend()
+        ax.grid(axis="y", linestyle="--", alpha=0.3)
         plt.tight_layout()
+
         fig_path = MAP_DIR / "fusion_vs_optical.png"
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
@@ -1160,7 +1075,6 @@ def _save_fusion_comparison_plot(results, class_names):
         print(f"  Warning: Failed to save fusion comparison plot: {e}")
 
 
-# ✅ FEATURE 3 - SAR: Cloud recovery simulation phase
 def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
     """
     Demonstrates SAR recovery under simulated cloud cover.
@@ -1193,7 +1107,6 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
 
         stats_path = data_dir / "band_stats.npy"
 
-        # ✅ FEATURE 3 - SAR: Load both models
         if not best_ckpt_optical or not Path(best_ckpt_optical).exists():
             print("  Warning: Optical checkpoint not found. Skipping cloud simulation.")
             return
@@ -1205,8 +1118,6 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
         model_optical.eval()
         model_optical.freeze()
 
-        # ✅ FIXED BUG 3 (part 2): pass explicit in_channels so fusion
-        #                          checkpoint loads with correct first conv
         model_fusion = LandCoverModule.load_from_checkpoint(
             best_ckpt_fusion,
             in_channels=NUM_BANDS_FUSION,
@@ -1215,7 +1126,6 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
         model_fusion.eval()
         model_fusion.freeze()
 
-        # ✅ FEATURE 3 - SAR: Load test dataset (optical only)
         test_ds = LandCoverDataset(
             data_dir / "test" / "images",
             data_dir / "test" / "labels",
@@ -1236,11 +1146,9 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
             img, label = test_ds[i]
             label_np = label.numpy()
 
-            # ✅ FEATURE 3 - SAR: 1. Clean prediction (reference)
             with torch.no_grad():
                 pred_clean = model_optical(img.unsqueeze(0)).argmax(dim=1).squeeze().numpy()
 
-            # ✅ FEATURE 3 - SAR: 2. Create cloud mask — zero out 100x100 region
             clouded_img = img.clone()
             h, w = img.shape[1], img.shape[2]
             cloud_size = min(100, h, w)
@@ -1248,26 +1156,19 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
             cx = rng.integers(0, max(1, w - cloud_size))
             clouded_img[:, cy : cy + cloud_size, cx : cx + cloud_size] = 0.0
 
-            # ✅ FEATURE 3 - SAR: 3. Optical prediction on clouded image
             with torch.no_grad():
-                pred_clouded = (
-                    model_optical(clouded_img.unsqueeze(0)).argmax(dim=1).squeeze().numpy()
-                )
+                pred_clouded = (model_optical(clouded_img.unsqueeze(0)).argmax(dim=1).squeeze().numpy())
 
-            # ✅ FEATURE 3 - SAR: 4. Fusion prediction on clouded optical + SAR
             try:
                 sar = generate_sar_for_patch(label_np, seed=i + 10000)
                 sar_tensor = torch.from_numpy(sar).float()
                 fused_input = torch.cat([clouded_img, sar_tensor], dim=0)
                 with torch.no_grad():
-                    pred_fusion = (
-                        model_fusion(fused_input.unsqueeze(0)).argmax(dim=1).squeeze().numpy()
-                    )
+                    pred_fusion = (model_fusion(fused_input.unsqueeze(0)).argmax(dim=1).squeeze().numpy())
             except Exception as e:
                 print(f"  Warning: Fusion prediction failed for patch {i}: {e}")
-                pred_fusion = pred_clouded  # fallback
+                pred_fusion = pred_clouded
 
-            # ✅ FEATURE 3 - SAR: Compute IoU vs clean reference
             iou_clouded = iou_metric_fn(
                 torch.from_numpy(pred_clouded).unsqueeze(0),
                 torch.from_numpy(pred_clean).unsqueeze(0),
@@ -1280,34 +1181,27 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
             ).item()
             iou_metric_fn.reset()
 
-            # ✅ FEATURE 3 - SAR: 5. Plot 4 columns
-            # Col 1: Clean RGB
             rgb = img[[3, 2, 1]].numpy().transpose(1, 2, 0)
             rgb = (rgb - rgb.min()) / (rgb.max() - rgb.min() + 1e-8)
             axes[i, 0].imshow(rgb)
             axes[i, 0].set_title("Clean RGB")
             axes[i, 0].axis("off")
 
-            # Col 2: Clouded RGB
             rgb_cloud = clouded_img[[3, 2, 1]].numpy().transpose(1, 2, 0)
             rgb_cloud = (rgb_cloud - rgb_cloud.min()) / (rgb_cloud.max() - rgb_cloud.min() + 1e-8)
             axes[i, 1].imshow(rgb_cloud)
             axes[i, 1].set_title("Clouded RGB")
             axes[i, 1].axis("off")
 
-            # Col 3: Optical pred (clouded)
             axes[i, 2].imshow(pred_clouded, cmap=cmap, vmin=0, vmax=9)
             axes[i, 2].set_title(f"Optical Pred\n(IoU: {iou_clouded * 100:.1f}%)")
             axes[i, 2].axis("off")
 
-            # Col 4: Fusion pred (clouded + SAR)
             axes[i, 3].imshow(pred_fusion, cmap=cmap, vmin=0, vmax=9)
             axes[i, 3].set_title(f"Fusion Pred\n(IoU: {iou_fusion * 100:.1f}%)")
             axes[i, 3].axis("off")
 
-        plt.suptitle(
-            "Cloud Recovery: Optical vs SAR+Optical Fusion", fontsize=14, fontweight="bold"
-        )
+        plt.suptitle("Cloud Recovery: Optical vs SAR+Optical Fusion", fontsize=14, fontweight="bold")
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         fig_path = MAP_DIR / "cloud_recovery.png"
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
@@ -1318,34 +1212,24 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
         print(f"  ERROR: Cloud simulation failed: {e}")
 
 
-# ----------------------------------------------------------------------
-#  MAIN
-# ----------------------------------------------------------------------
-def main(
-    mode="quickstart", model="unet", fusion=False, gee_project=None
-):  # ✅ FEATURE 5 - SEGFORMER: accept model arg  # ✅ FEATURE 3 - SAR: accept fusion arg
+def main(mode="quickstart", model="unet", fusion=False, gee_project=None):
+    """Run the full segmentation pipeline end-to-end."""
     print("+" + "=" * 68 + "+")
     print("|  Sentinel-2 Land Cover Segmentation -- Full Pipeline              |")
-    model_label = (
-        model.upper() if model != "unet" else f"UNet-{ENCODER.capitalize()}"
-    )  # ✅ FEATURE 5 - SEGFORMER: dynamic label
+    model_label = model.upper() if model != "unet" else f"UNet-{ENCODER.capitalize()}"
     print(f"|  Mode: {mode.upper():<10s} |  Model: {model_label:<16s} |  10 Classes      |")
     print("+" + "=" * 68 + "+")
 
     seed_everything()
     t_start = time.time()
 
-    # Clear stale results to prevent dashboard confusion
     stale_map = MAP_DIR / "full_stitched_scene.png"
     if stale_map.exists():
         stale_map.unlink()
 
-    # Phase 1: Data
     class_counts, data_dir = phase_data(mode=mode, gee_project=gee_project)
 
-    # ✅ FEATURE 5 - SEGFORMER: Model selection branching
     if model == "both":
-        # ✅ FEATURE 5 - SEGFORMER: Run full benchmark — train and eval both models
         try:
             try:
                 from src.models.benchmark import run_benchmark, save_benchmark_report
@@ -1369,15 +1253,13 @@ def main(
                     patience=PATIENCE,
                     encoder=ENCODER,
                     lr=LR,
-                    fusion=fusion,  # ✅ FEATURE 3 - SAR: pass fusion flag
-                    num_bands_fusion=NUM_BANDS_FUSION
-                    if fusion
-                    else 0,  # ✅ FEATURE 3 - SAR: pass fusion channel count
+                    fusion=fusion,
+                    num_bands_fusion=NUM_BANDS_FUSION if fusion else 0,
                 )
                 benchmark_results.append(result)
 
             save_benchmark_report(benchmark_results, CLASS_NAMES, REPORT_DIR, MAP_DIR)
-            best_ckpt = benchmark_results[0].get("best_ckpt", "")  # UNet ckpt for downstream phases
+            best_ckpt = benchmark_results[0].get("best_ckpt", "")
             if not best_ckpt:
                 raise RuntimeError("Benchmark did not produce a checkpoint.")
 
@@ -1390,13 +1272,15 @@ def main(
             downstream_model_name = "unet"
         except Exception as e:
             print(f"\n  ERROR: Benchmark mode failed: {e}")
+            import traceback
+
+            traceback.print_exc()
             print("  Falling back to UNet-only training...")
             best_ckpt = phase_train(class_counts, data_dir, fusion=fusion)
             metrics = phase_evaluate(best_ckpt, data_dir, fusion=fusion, model_name="unet")
             downstream_model_name = "unet"
 
     elif model == "segformer":
-        # ✅ FEATURE 5 - SEGFORMER: Train SegFormer only — mirror existing UNet flow
         try:
             try:
                 from src.models.benchmark import run_benchmark
@@ -1417,56 +1301,45 @@ def main(
                 patience=PATIENCE,
                 encoder=ENCODER,
                 lr=LR,
-                fusion=fusion,  # ✅ FEATURE 3 - SAR: pass fusion flag
-                num_bands_fusion=NUM_BANDS_FUSION
-                if fusion
-                else 0,  # ✅ FEATURE 3 - SAR: pass fusion channel count
+                fusion=fusion,
+                num_bands_fusion=NUM_BANDS_FUSION if fusion else 0,
             )
             best_ckpt = result.get("best_ckpt", "")
             if not best_ckpt:
                 raise RuntimeError("SegFormer benchmark did not produce a checkpoint.")
 
-            metrics = {
-                k: result[k]
-                for k in ["overall_accuracy", "mean_iou", "per_class_iou", "per_class_f1"]
-            }
+            metrics = phase_evaluate(best_ckpt, data_dir, fusion=fusion, model_name="segformer")
             downstream_model_name = "segformer"
         except Exception as e:
             print(f"\n  ERROR: SegFormer training failed: {e}")
+            import traceback
+
+            traceback.print_exc()
             print("  Falling back to UNet-only training...")
             best_ckpt = phase_train(class_counts, data_dir, fusion=fusion)
             metrics = phase_evaluate(best_ckpt, data_dir, fusion=fusion, model_name="unet")
             downstream_model_name = "unet"
 
     else:
-        # ✅ FEATURE 5 - SEGFORMER: existing UNet-only flow — unchanged
-        # Phase 2: Training
         best_ckpt = phase_train(class_counts, data_dir, fusion=fusion)
-        # Phase 3: Evaluation
         metrics = phase_evaluate(best_ckpt, data_dir, fusion=fusion, model_name="unet")
         downstream_model_name = "unet"
 
-    # Phase 4: Post-processing
-    post_metrics = phase_postprocess(
-        best_ckpt, data_dir, fusion=fusion, model_name=downstream_model_name
-    )
+    post_metrics = phase_postprocess(best_ckpt, data_dir, fusion=fusion, model_name=downstream_model_name)
 
-    # Phase 5: Change Detection
-    phase_change_detection(
-        best_ckpt, data_dir, mode=mode, fusion=fusion, model_name=downstream_model_name
-    )
+    phase_change_detection(best_ckpt, data_dir, mode=mode, fusion=fusion, model_name=downstream_model_name)
 
-    # ✅ ADDED: Phase 6: Stitching
     phase_stitch(best_ckpt, data_dir, fusion=fusion, model_name=downstream_model_name)
 
-    # ✅ FEATURE 1 - TIMESERIES: Phase 7
     phase_timeseries(data_dir)
 
-    # ✅ FEATURE 3 - SAR: Run fusion comparison and cloud simulation when --fusion is active
     if fusion:
         try:
             ckpt_optical, ckpt_fusion, fusion_results = phase_fusion_comparison(
-                class_counts, data_dir
+                class_counts,
+                data_dir,
+                model_name=downstream_model_name,
+                main_result=(metrics if downstream_model_name == "segformer" else None),
             )
             if ckpt_optical and ckpt_fusion:
                 phase_cloud_simulation(ckpt_optical, ckpt_fusion, data_dir)
@@ -1475,7 +1348,6 @@ def main(
         except Exception as e:
             print(f"  Warning: SAR Fusion phases failed: {e}")
 
-    # ── Summary ───────────────────────────────────────────────────────
     elapsed = time.time() - t_start
     print("\n" + "=" * 70)
     print("  PIPELINE COMPLETE                                              ")
@@ -1506,17 +1378,15 @@ if __name__ == "__main__":
         default="unet",
         choices=["unet", "segformer", "both"],
         help="Model architecture to train/evaluate",
-    )  # ✅ FEATURE 5 - SEGFORMER: model selection CLI arg
+    )
     parser.add_argument(
         "--fusion",
         action="store_true",
         default=False,
         help="Enable SAR + Optical fusion (Sentinel-1 + Sentinel-2)",
-    )  # ✅ FEATURE 3 - SAR: fusion CLI flag
+    )
     parser.add_argument(
         "--gee_project", type=str, default=None, help="Google Cloud Project ID for Earth Engine"
     )
     args = parser.parse_args()
-    main(
-        mode=args.mode, model=args.model, fusion=args.fusion, gee_project=args.gee_project
-    )  # ✅ FEATURE 5 - SEGFORMER: pass model arg  # ✅ FEATURE 3 - SAR: pass fusion arg
+    main(mode=args.mode, model=args.model, fusion=args.fusion, gee_project=args.gee_project)

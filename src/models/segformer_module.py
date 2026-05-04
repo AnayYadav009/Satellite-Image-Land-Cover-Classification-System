@@ -1,13 +1,9 @@
 """
-✅ FEATURE 5 - SEGFORMER: SegFormer semantic segmentation Lightning module.
-Uses nvidia/mit-b0 backbone fine-tuned for land cover classification.
-Input:  (B, C, H, W) float32 — same format as LandCoverModule.
-Output: (B, num_classes, H, W) logits at full resolution.
+SegFormer semantic segmentation Lightning module.
 
-Note on input channels: SegFormer's pretrained weights expect 3 channels
-(RGB). Since we have NUM_BANDS channels, we replace the patch embedding
-conv layer with a new Conv2d(NUM_BANDS, embed_dim, ...) and initialize it
-with kaiming_normal. The rest of the pretrained weights are kept.
+Uses nvidia/mit-b0 backbone fine-tuned for land cover classification.
+The pretrained 3-channel patch embedding is replaced with a new Conv2d
+accepting NUM_BANDS channels, initialized with kaiming_normal.
 """
 
 import pytorch_lightning as pl
@@ -15,41 +11,57 @@ import segmentation_models_pytorch as smp
 import torch
 import torch.nn.functional as F
 from torchmetrics import Accuracy, F1Score, JaccardIndex
-from transformers import (  # ✅ FEATURE 5 - SEGFORMER: HuggingFace SegFormer
+from transformers import (
     SegformerConfig,
     SegformerForSemanticSegmentation,
 )
+import numpy as np
+
+try:
+    import torch.serialization
+
+    torch.serialization.add_safe_globals(
+        [
+            np._core.multiarray._reconstruct,
+            np.dtype,
+            np.ndarray,
+            np.dtypes.Float32DType,
+            np.dtypes.Int64DType,
+        ]
+    )
+except (ImportError, AttributeError):
+    pass
 
 
 class SegFormerModule(pl.LightningModule):
-    """
-    SegFormer semantic segmentation module.
-    Uses nvidia/mit-b0 backbone fine-tuned for land cover classification.
-    Input:  (B, C, H, W) float32 — same format as LandCoverModule.
-    Output: (B, num_classes, H, W) logits at full resolution.
+    """SegFormer semantic segmentation module using nvidia/mit-b0 backbone.
 
-    Note on input channels: SegFormer's pretrained weights expect 3 channels
-    (RGB). Since we have NUM_BANDS channels, we replace the patch embedding
-    conv layer with a new Conv2d(NUM_BANDS, embed_dim, ...) and initialize it
-    with kaiming_normal. The rest of the pretrained weights are kept.
+    Input:  (B, C, H, W) float32
+    Output: (B, num_classes, H, W) logits upsampled to full resolution.
     """
 
     def __init__(self, num_classes, num_bands, lr=5e-4, class_weights=None):
-        """
-        Initialize SegFormer module with pretrained nvidia/mit-b0 backbone.
+        """Initialize SegFormer module.
 
         Args:
             num_classes: Number of output segmentation classes.
-            num_bands: Number of input spectral bands (replaces default 3-channel input).
+            num_bands: Number of input spectral bands.
             lr: Learning rate for AdamW optimizer.
-            class_weights: Optional array of per-class weights for loss weighting.
+            class_weights: Optional per-class weight array for loss weighting.
         """
         super().__init__()
-        self.save_hyperparameters()
+        weights_list = (
+            class_weights.tolist() if isinstance(class_weights, np.ndarray) else class_weights
+        )
+        self.save_hyperparameters(ignore=["class_weights"])
+        self.hparams.class_weights = weights_list
+
+        if class_weights is not None and isinstance(class_weights, np.ndarray):
+            class_weights = torch.from_numpy(class_weights).float()
+
         self.lr = lr
         self.num_classes = num_classes
 
-        # ✅ FEATURE 5 - SEGFORMER: Load pretrained config and model
         try:
             config = SegformerConfig.from_pretrained(
                 "nvidia/mit-b0",
@@ -68,8 +80,6 @@ class SegFormerModule(pl.LightningModule):
                 "first-time model download."
             ) from e
 
-        # ✅ FEATURE 5 - SEGFORMER: Replace first patch embedding conv to accept NUM_BANDS input channels
-        # Original: PatchEmbedding.proj = Conv2d(3, 32, kernel_size=7, stride=4, padding=3)
         old_proj = self.model.segformer.encoder.patch_embeddings[0].proj
         new_proj = torch.nn.Conv2d(
             num_bands,
@@ -83,7 +93,6 @@ class SegFormerModule(pl.LightningModule):
             torch.nn.init.zeros_(new_proj.bias)
         self.model.segformer.encoder.patch_embeddings[0].proj = new_proj
 
-        # ✅ FEATURE 5 - SEGFORMER: Combined Focal + Dice loss — same as LandCoverModule for fair comparison
         self.focal_loss = smp.losses.FocalLoss(
             mode="multiclass", alpha=0.25, gamma=2.0, ignore_index=9
         )
@@ -99,16 +108,12 @@ class SegFormerModule(pl.LightningModule):
             ignore_index=(9 if valid_classes is None else None),
         )
 
-        # ✅ FEATURE 5 - SEGFORMER: Validation metrics — same as LandCoverModule
         self.val_iou = JaccardIndex(task="multiclass", num_classes=num_classes, average="macro")
         self.val_acc = Accuracy(task="multiclass", num_classes=num_classes)
         self.val_f1 = F1Score(task="multiclass", num_classes=num_classes, average="macro")
 
     def forward(self, x):
-        """
-        Forward pass through SegFormer.
-        SegFormer returns logits at 1/4 resolution (H/4, W/4).
-        We bilinearly upsample back to (H, W) to match UNet output format.
+        """Forward pass with bilinear upsampling to input resolution.
 
         Args:
             x: Input tensor of shape (B, C, H, W).
@@ -117,7 +122,7 @@ class SegFormerModule(pl.LightningModule):
             Logits tensor of shape (B, num_classes, H, W).
         """
         outputs = self.model(pixel_values=x)
-        logits = outputs.logits  # (B, num_classes, H/4, W/4)
+        logits = outputs.logits
         logits = F.interpolate(
             logits,
             size=x.shape[-2:],
@@ -127,7 +132,7 @@ class SegFormerModule(pl.LightningModule):
         return logits
 
     def _shared_step(self, batch):
-        """Shared forward + loss computation for train and val steps."""
+        """Shared forward and loss computation for train/val steps."""
         x, y = batch
         logits = self(x)
         loss = 0.5 * self.focal_loss(logits, y) + 0.5 * self.dice_loss(logits, y)
@@ -135,13 +140,13 @@ class SegFormerModule(pl.LightningModule):
         return loss, preds, y
 
     def training_step(self, batch, batch_idx):
-        """Training step: compute loss and log."""
+        """Compute training loss and log."""
         loss, _, _ = self._shared_step(batch)
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        """Validation step: compute loss, update metrics, and log."""
+        """Compute validation loss, update metrics, and log."""
         loss, preds, y = self._shared_step(batch)
         self.val_iou(preds, y)
         self.val_acc(preds, y)

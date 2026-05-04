@@ -1,9 +1,24 @@
+"""
+Augmentation pipelines for multispectral land-cover segmentation training.
+
+Provides spatial augmentations suitable for satellite imagery where standard
+RGB color jitter is not applicable due to multispectral band structure.
+"""
+
 import albumentations as A
-import cv2  # ✅ FIXED: Add import cv2 at the top
+import cv2
 
 
 def get_train_transforms():
-    """Returns spatial and color augmentations for training."""
+    """Return an albumentations Compose pipeline with spatial augmentations for training.
+
+    Includes horizontal/vertical flips, 90-degree rotations, and affine
+    shift-scale-rotate with reflective border padding. Color jitter is
+    intentionally omitted because the data is multispectral.
+
+    Returns:
+        A.Compose: Configured augmentation pipeline.
+    """
     return A.Compose(
         [
             A.HorizontalFlip(p=0.5),
@@ -15,12 +30,15 @@ def get_train_transforms():
                 rotate_limit=45,
                 p=0.5,
                 border_mode=cv2.BORDER_REFLECT,
-            ),  # ✅ FIXED: Add border_mode parameter
-            # Note: We avoid standard RGB color jitter as we have multispectral data
+            ),
         ]
     )
 
 
 def get_val_transforms():
-    """Returns no-op transforms for validation."""
+    """Return an identity (no-op) augmentation pipeline for validation.
+
+    Returns:
+        A.Compose: Empty augmentation pipeline.
+    """
     return A.Compose([])

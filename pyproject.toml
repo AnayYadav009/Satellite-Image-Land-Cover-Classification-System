@@ -19,15 +19,15 @@ dependencies = [
     "pyyaml",
     "earthengine-api",
     "geemap",
-    "scikit-image",        # ✅ ADDED: skimage used in phase_postprocess
-    "scipy",               # ✅ ADDED: gaussian_filter in download_quickstart.py
-    "opencv-python",       # ✅ ADDED: cv2 used in dataset.py and augmentations.py
-    "streamlit",           # ✅ ADDED: entire dashboard (app.py)
-    "Pillow",              # ✅ ADDED: Image.open() in app.py
-    "torchmetrics",        # ✅ ADDED: JaccardIndex, Accuracy, F1Score in pipeline
-    "folium",              # ✅ FEATURE 4 - MAP: needed for rendering map
-    "streamlit-folium",    # ✅ FEATURE 4 - MAP: needed for integrating folium in streamlit
-    "transformers",        # ✅ FEATURE 5 - SEGFORMER: HuggingFace SegFormer model
+    "scikit-image",
+    "scipy",
+    "opencv-python",
+    "streamlit",
+    "Pillow",
+    "torchmetrics",
+    "folium",
+    "streamlit-folium",
+    "transformers",
 ]
 
 [tool.ruff]

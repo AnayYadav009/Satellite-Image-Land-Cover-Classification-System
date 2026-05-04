@@ -1,7 +1,9 @@
 """
-✅ FEATURE 5 - SEGFORMER: Benchmark module for comparing UNet vs SegFormer.
-Trains and evaluates both models on the same data with the same config,
-then produces a side-by-side comparison report.
+Benchmark module for comparing UNet vs SegFormer.
+
+Trains and evaluates both models on the same data with identical
+configuration, then produces a side-by-side comparison report with
+per-class IoU charts and summary metrics tables.
 """
 
 import json
@@ -10,7 +12,7 @@ from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("Agg")  # ✅ FEATURE 5 - SEGFORMER: non-interactive backend for benchmark plots
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import pytorch_lightning as pl
@@ -19,12 +21,28 @@ from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from torch.utils.data import DataLoader
 from torchmetrics import Accuracy, F1Score, JaccardIndex
 
-# ── PyTorch 2.6 compatibility ─────────────────────────────────────────
+try:
+    import torch.serialization
+
+    torch.serialization.add_safe_globals(
+        [
+            np._core.multiarray._reconstruct,
+            np.dtype,
+            np.ndarray,
+            np.dtypes.Float32DType,
+            np.dtypes.Int64DType,
+        ]
+    )
+except (ImportError, AttributeError):
+    pass
+
 _orig_torch_load = torch.load
 
 
 def _patched_torch_load(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
+    """Patch torch.load to default to weights_only=False for local checkpoints."""
+    if "weights_only" not in kwargs:
+        kwargs["weights_only"] = False
     return _orig_torch_load(*args, **kwargs)
 
 
@@ -32,7 +50,7 @@ torch.load = _patched_torch_load
 
 
 def run_benchmark(
-    model_name: str,  # "unet" or "segformer"
+    model_name: str,
     class_counts: np.ndarray,
     data_dir: Path,
     out_dir: Path,
@@ -45,24 +63,33 @@ def run_benchmark(
     patience: int = 10,
     encoder: str = "resnet34",
     lr: float = 5e-4,
-    fusion: bool = False,  # ✅ FEATURE 3 - SAR: whether to use fusion dataset
-    num_bands_fusion: int = 0,  # ✅ FEATURE 3 - SAR: fusion channel count
+    fusion: bool = False,
+    num_bands_fusion: int = 0,
 ) -> dict:
-    """
-    Trains and evaluates a single model (UNet or SegFormer) end-to-end.
+    """Train and evaluate a single model end-to-end.
 
-    Returns a results dict with keys:
-        'model':            str
-        'best_ckpt':        str (path to best checkpoint)
-        'overall_accuracy': float
-        'mean_iou':         float
-        'per_class_iou':    dict {class_name: float}
-        'per_class_f1':     dict {class_name: float}
-        'train_time_sec':   float
-    All training artifacts saved under ckpt_dir / model_name /
+    Args:
+        model_name: Model architecture name (``"unet"`` or ``"segformer"``).
+        class_counts: Per-class pixel counts from training data.
+        data_dir: Path to the dataset directory.
+        out_dir: Root output directory for logs and artifacts.
+        ckpt_dir: Directory for saving model checkpoints.
+        num_classes: Number of segmentation classes.
+        num_bands: Number of optical input bands.
+        class_names: List of class name strings.
+        batch_size: Training batch size.
+        max_epochs: Maximum training epochs.
+        patience: Early stopping patience.
+        encoder: UNet encoder backbone name.
+        lr: Learning rate.
+        fusion: Whether to use the SAR+optical fusion dataset.
+        num_bands_fusion: Total channel count when fusion is active.
+
+    Returns:
+        Dict with keys: model, best_ckpt, overall_accuracy, mean_iou,
+        per_class_iou, per_class_f1, train_time_sec.
     """
     try:
-        # ✅ FEATURE 5 - SEGFORMER: Import dataset and augmentation dependencies
         try:
             from ..data.dataset import LandCoverDataset
             from ..training.augmentations import get_train_transforms, get_val_transforms
@@ -70,7 +97,6 @@ def run_benchmark(
             from src.data.dataset import LandCoverDataset
             from src.training.augmentations import get_train_transforms, get_val_transforms
 
-        # ✅ FEATURE 3 - SAR: Conditionally use FusionDataset
         if fusion:
             try:
                 try:
@@ -94,7 +120,6 @@ def run_benchmark(
 
         stats_path = data_dir / "band_stats.npy"
 
-        # ✅ FEATURE 5 - SEGFORMER: Create datasets
         train_ds = DatasetClass(
             data_dir / "train" / "images",
             data_dir / "train" / "labels",
@@ -121,7 +146,6 @@ def run_benchmark(
         )
         test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        # ✅ FEATURE 5 - SEGFORMER: Compute class weights (smoothed inverse frequency)
         total = class_counts.sum()
         freq = class_counts.astype(np.float64) / (total + 1e-8)
         weights = 1.0 / (freq + 0.05)
@@ -130,7 +154,6 @@ def run_benchmark(
             np.float32
         )
 
-        # ✅ FEATURE 5 - SEGFORMER: Instantiate the correct model
         if model_name == "segformer":
             try:
                 from .segformer_module import SegFormerModule
@@ -143,17 +166,14 @@ def run_benchmark(
                 class_weights=weights,
             )
         else:
-            # UNet — import LandCoverModule from run_pipeline
-            # We import dynamically to avoid circular imports
             import importlib
 
             pipeline = importlib.import_module("run_pipeline")
             model = pipeline.LandCoverModule(
                 class_weights=weights,
-                in_channels=in_channels,  # ✅ FEATURE 3 - SAR: pass dynamic channel count
+                in_channels=in_channels,
             )
 
-        # ✅ FEATURE 5 - SEGFORMER: Setup callbacks and trainer
         model_ckpt_dir = ckpt_dir / model_name
         model_ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -179,16 +199,17 @@ def run_benchmark(
             enable_progress_bar=True,
         )
 
-        # ✅ FEATURE 5 - SEGFORMER: Train
         t0 = time.time()
         try:
             trainer.fit(model, train_loader, val_loader)
         except Exception as e:
             print(f"\n  Warning: {model_name} training encountered an error: {e}")
+            import traceback
+
+            traceback.print_exc()
             print("  Attempting to proceed with evaluation using existing checkpoints...")
         train_time = time.time() - t0
 
-        # ✅ FEATURE 5 - SEGFORMER: Find best checkpoint
         best_path = checkpoint_cb.best_model_path
         if not best_path or not Path(best_path).exists():
             ckpts = list(model_ckpt_dir.glob("*.ckpt"))
@@ -197,13 +218,14 @@ def run_benchmark(
             else:
                 raise FileNotFoundError(f"No checkpoints found for {model_name}. Training failed.")
 
-        # ✅ FEATURE 5 - SEGFORMER: Evaluate on test set
         if model_name == "segformer":
             try:
                 from .segformer_module import SegFormerModule
             except (ImportError, ValueError):
                 from src.models.segformer_module import SegFormerModule
-            eval_model = SegFormerModule.load_from_checkpoint(best_path, strict=False)
+            eval_model = SegFormerModule.load_from_checkpoint(
+                best_path, num_bands=in_channels, strict=False
+            )
         else:
             import importlib
 
@@ -230,7 +252,6 @@ def run_benchmark(
         per_class_f1 = f1_metric.compute().numpy()
         mean_iou = per_class_iou.mean()
 
-        # ✅ FEATURE 5 - SEGFORMER: Build results dict
         result = {
             "model": model_name,
             "best_ckpt": str(best_path),
@@ -254,7 +275,9 @@ def run_benchmark(
 
     except Exception as e:
         print(f"\n  ERROR: Benchmark for {model_name} failed: {e}")
-        # ✅ FEATURE 5 - SEGFORMER: Return a safe fallback so pipeline doesn't crash
+        import traceback
+
+        traceback.print_exc()
         return {
             "model": model_name,
             "best_ckpt": "",
@@ -267,24 +290,24 @@ def run_benchmark(
 
 
 def save_benchmark_report(
-    results: list,  # one dict per model from run_benchmark
+    results: list,
     class_names: list,
     report_dir: Path,
     map_dir: Path,
 ) -> None:
-    """
-    Saves two artifacts:
+    """Save benchmark results as JSON and a comparison figure.
 
-    1. report_dir / "benchmark_results.json"
-       Full results dict for both models.
+    Produces:
+        1. ``report_dir/benchmark_results.json`` — full results for all models.
+        2. ``map_dir/benchmark_comparison.png`` — per-class IoU bar chart and summary table.
 
-    2. map_dir / "benchmark_comparison.png"
-       A figure with two subplots side by side:
-         Left  — Per-class IoU grouped bar chart
-         Right — Summary metrics table with colored cells
+    Args:
+        results: List of result dicts from ``run_benchmark``.
+        class_names: List of class name strings.
+        report_dir: Directory for JSON report output.
+        map_dir: Directory for PNG figure output.
     """
     try:
-        # ✅ FEATURE 5 - SEGFORMER: Save JSON report
         report_dir.mkdir(parents=True, exist_ok=True)
         map_dir.mkdir(parents=True, exist_ok=True)
 
@@ -293,19 +316,14 @@ def save_benchmark_report(
             json.dump(results, f, indent=2)
         print(f"\n  [Benchmark] JSON report saved to {report_path}")
 
-        # ✅ FEATURE 5 - SEGFORMER: Create comparison figure
         fig, (ax_bar, ax_table) = plt.subplots(
             1, 2, figsize=(18, 7), gridspec_kw={"width_ratios": [2, 1]}
         )
 
-        # --- Left: Per-class IoU grouped bar chart ---
         n_classes = len(class_names)
         x = np.arange(n_classes)
         bar_width = 0.35
-        colors = [
-            "#4285F4",
-            "#FF7043",
-        ]  # ✅ FEATURE 5 - SEGFORMER: blue for UNet, orange for SegFormer
+        colors = ["#4285F4", "#FF7043"]
 
         for idx, result in enumerate(results):
             iou_values = [result["per_class_iou"].get(name, 0.0) * 100 for name in class_names]
@@ -318,8 +336,6 @@ def save_benchmark_report(
                 color=colors[idx % 2],
                 alpha=0.85,
             )
-
-            # ✅ FEATURE 5 - SEGFORMER: Horizontal dashed line at mIoU
             ax_bar.axhline(
                 y=result["mean_iou"] * 100,
                 color=colors[idx % 2],
@@ -328,7 +344,6 @@ def save_benchmark_report(
                 linewidth=1,
             )
 
-        # ✅ FEATURE 5 - SEGFORMER: Abbreviate class names to 6 chars
         short_names = [name[:6] for name in class_names]
         ax_bar.set_xticks(x + bar_width / 2)
         ax_bar.set_xticklabels(short_names, rotation=45, ha="right", fontsize=9)
@@ -338,7 +353,6 @@ def save_benchmark_report(
         ax_bar.legend(loc="upper right", fontsize=9)
         ax_bar.grid(axis="y", alpha=0.3)
 
-        # --- Right: Summary metrics table ---
         ax_table.axis("off")
 
         if len(results) >= 2:
@@ -351,21 +365,19 @@ def save_benchmark_report(
                 [f"{r0['train_time_sec'] / 60:.1f} min", f"{r1['train_time_sec'] / 60:.1f} min"],
             ]
 
-            # ✅ FEATURE 5 - SEGFORMER: Color cells green/red based on winner
             cell_colors = []
             comparisons = [
                 (r0["overall_accuracy"], r1["overall_accuracy"]),
                 (r0["mean_iou"], r1["mean_iou"]),
-                # For training time, lower is better
                 (r1["train_time_sec"], r0["train_time_sec"]),
             ]
             for v0, v1 in comparisons:
                 if v0 > v1:
-                    cell_colors.append(["#C8E6C9", "#FFCDD2"])  # green, red
+                    cell_colors.append(["#C8E6C9", "#FFCDD2"])
                 elif v1 > v0:
-                    cell_colors.append(["#FFCDD2", "#C8E6C9"])  # red, green
+                    cell_colors.append(["#FFCDD2", "#C8E6C9"])
                 else:
-                    cell_colors.append(["#E0E0E0", "#E0E0E0"])  # tie = grey
+                    cell_colors.append(["#E0E0E0", "#E0E0E0"])
 
             table = ax_table.table(
                 cellText=cell_text,
@@ -380,7 +392,6 @@ def save_benchmark_report(
             table.scale(1.2, 1.8)
             ax_table.set_title("Summary Metrics", fontsize=13, fontweight="bold", pad=20)
         else:
-            # ✅ FEATURE 5 - SEGFORMER: Single model — just show text
             r = results[0]
             ax_table.text(
                 0.5,

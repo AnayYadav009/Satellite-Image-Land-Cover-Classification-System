@@ -1,16 +1,31 @@
+"""
+NDVI seasonal trend visualization.
+
+Plots monthly mean NDVI with standard deviation bands and marks
+peak/trough months for vegetation health monitoring.
+"""
+
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-# ✅ FEATURE 1 - TIMESERIES: Plot seasonal NDVI trend
 def plot_ndvi_curve(
-    stats: dict,  # from compute_ndvi_stats
+    stats: dict,
     month_names: list[str],
     output_path: str,
 ) -> None:
-    """Plots a line chart of monthly mean NDVI ± 1 std as a shaded band.
-    Marks peak and trough months with vertical dashed lines.
-    Saves to output_path as PNG at 150 dpi."""
+    """Plot a seasonal NDVI trend line with standard deviation shading.
+
+    Draws a line chart of monthly mean NDVI values with ±1 std as a
+    shaded band, and marks the peak and trough months with vertical
+    dashed lines.
+
+    Args:
+        stats: Dict from compute_ndvi_stats with keys 'monthly_mean',
+               'monthly_std', 'peak_month', and 'trough_month'.
+        month_names: List of month name strings for x-axis labels.
+        output_path: File path to save the plot as PNG (150 dpi).
+    """
     try:
         means = np.array(stats["monthly_mean"])
         stds = np.array(stats["monthly_std"])
@@ -22,7 +37,6 @@ def plot_ndvi_curve(
             x, means - stds, means + stds, color="green", alpha=0.2, label="±1 Std Dev"
         )
 
-        # Mark peak and trough
         peak = stats["peak_month"]
         trough = stats["trough_month"]
 
