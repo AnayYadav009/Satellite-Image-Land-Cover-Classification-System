@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from collections import deque
 
 import pandas as pd
 import streamlit as st
@@ -22,6 +23,18 @@ MAP_DIR = OUTPUT_DIR / "maps"
 REPORT_DIR = OUTPUT_DIR / "reports"
 METRICS_FILE = REPORT_DIR / "metrics.json"
 LOG_FILE = OUTPUT_DIR / "pipeline.log"
+
+try:
+    from src.vis.map_export import build_folium_map
+except (ImportError, ModuleNotFoundError):
+    from vis.map_export import build_folium_map
+
+
+@st.cache_resource
+def get_cached_map(overlay_path: str, bounds_tuple: tuple) -> st.cache_resource:
+    """Cache the Folium map generation to avoid heavy recreation on every re-run."""
+    return build_folium_map(overlay_path, list(bounds_tuple))
+
 
 st.set_page_config(
     page_title="Sentinel-2 Segmentation Dashboard",
@@ -78,9 +91,11 @@ if st.sidebar.button(
         st.write("Initializing environment...")
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"  # Prevent stdout buffering for real-time logs
 
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        cmd = [sys.executable, "run_pipeline.py", "--mode", mode_arg, "--model", model_arg]
+        # Use python -u to ensure unbuffered output
+        cmd = [sys.executable, "-u", "run_pipeline.py", "--mode", mode_arg, "--model", model_arg]
         if use_fusion:
             cmd.append("--fusion")
         with open(LOG_FILE, "w", encoding="utf-8") as f:
@@ -96,16 +111,26 @@ if st.sidebar.button(
             )
 
             log_container = st.empty()
-            full_log = ""
+            log_queue = deque(maxlen=100)  # Safe circular buffer for logs
 
-            while True:
-                line = process.stdout.readline()
-                if not line and process.poll() is not None:
-                    break
-                if line:
-                    f.write(line)
-                    full_log += line
-                    log_container.code("\n".join(full_log.splitlines()[-10:]))
+            try:
+                while True:
+                    line = process.stdout.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    if line:
+                        f.write(line)
+                        log_queue.append(line.strip())
+                        # Render the last 10 lines in O(1) time
+                        log_container.code("\n".join(list(log_queue)[-10:]))
+            finally:
+                # Ensure the subprocess is terminated if the thread is interrupted
+                if process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
 
         st.session_state.running = False
         if process.returncode == 0:
@@ -231,15 +256,12 @@ with tabs[1]:
             import json
             from streamlit_folium import st_folium
 
-            try:
-                from src.vis.map_export import build_folium_map
-            except (ImportError, ModuleNotFoundError):
-                from vis.map_export import build_folium_map
-
             with open(bounds_path, "r") as f:
                 bounds = json.load(f)
 
-            m = build_folium_map(str(overlay_path), bounds)
+            # Convert list bounds to a hashable tuple for caching
+            bounds_tuple = tuple(bounds)
+            m = get_cached_map(str(overlay_path), bounds_tuple)
 
             st.markdown(
                 "Segmentation overlay on OpenStreetMap. "

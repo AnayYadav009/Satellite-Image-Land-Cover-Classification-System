@@ -49,12 +49,13 @@ def download_sentinel1_patch(
     date_start: str,
     date_end: str,
     output_path: str,
+    size_px: int = 256,
+    scale: int = 10,
 ) -> np.ndarray | None:
     """Download a Sentinel-1 GRD patch from Google Earth Engine.
 
-    **Stub** — real implementation requires GEE authentication. Would
-    download VV+VH for the given AOI and date range, apply terrain
-    correction, and return a (2, H, W) float32 array.
+    Queries the COPERNICUS/S1_GRD collection for VV and VH polarizations,
+    computes the cross-polarization ratio, converts it to a numpy array, and saves it.
 
     Args:
         lat: Latitude of the area of interest center.
@@ -62,9 +63,59 @@ def download_sentinel1_patch(
         date_start: Start date in ``YYYY-MM-DD`` format.
         date_end: End date in ``YYYY-MM-DD`` format.
         output_path: Path to save the downloaded patch.
+        size_px: Target pixel height/width.
+        scale: Resolution in meters per pixel.
 
     Returns:
-        None (stub implementation).
+        Float32 array of shape (3, H, W) containing [VV, VH, VV/VH ratio], or None on failure.
     """
-    print("WARNING: Real SAR download requires GEE auth. Using synthetic SAR.")
+    try:
+        import ee
+
+        point = ee.Geometry.Point([lon, lat])
+        region = point.buffer(size_px * scale / 2).bounds()
+
+        s1_col = (
+            ee.ImageCollection("COPERNICUS/S1_GRD")
+            .filterBounds(region)
+            .filterDate(date_start, date_end)
+            .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
+            .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH"))
+            .filter(ee.Filter.eq("instrumentMode", "IW"))
+        )
+
+        if s1_col.size().getInfo() == 0:
+            print(f"  [S1 Download] No Sentinel-1 imagery found for lat={lat}, lon={lon}")
+            return None
+
+        # Sort by time start to get the latest available image in date range
+        s1 = s1_col.sort("system:time_start", False).first()
+        s1_img = s1.select(["VV", "VH"])
+        # Compute ratio index: VV / (VH + eps)
+        ratio = s1_img.select("VV").divide(s1_img.select("VH").add(1e-8)).rename("VV_VH_ratio")
+        fused_s1 = s1_img.addBands(ratio)
+
+        import geemap
+
+        sar_np = geemap.ee_to_numpy(fused_s1, region=region, scale=scale)
+
+        if sar_np is not None:
+            import cv2
+
+            if sar_np.shape[:2] != (size_px, size_px):
+                sar_np = cv2.resize(sar_np, (size_px, size_px), interpolation=cv2.INTER_LINEAR)
+
+            # Map dB backscatter values (typically [-25.0, 0.0]) to [0.0, 1.0] linear scale proxy
+            sar_np = np.clip((sar_np + 25.0) / 25.0, 0.0, 1.0)
+            sar_np = sar_np.transpose(2, 0, 1).astype(np.float32)
+
+            import os
+
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            np.save(output_path, sar_np)
+            return sar_np
+
+    except Exception as e:
+        print(f"  [S1 Download] Real Sentinel-1 download failed for lat={lat}, lon={lon}: {e}")
+        print("  Using synthetic SAR fallback.")
     return None

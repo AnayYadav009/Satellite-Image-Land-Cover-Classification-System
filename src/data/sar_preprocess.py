@@ -98,7 +98,7 @@ def generate_synthetic_sar(
     label_map: np.ndarray,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Generate synthetic Sentinel-1 SAR backscatter from a label map.
+    """Generate synthetic Sentinel-1 SAR backscatter from a label map using vectorized indexing.
 
     Assigns approximate C-band backscatter values per land-cover class,
     adds per-pixel Gaussian noise, and applies Lee speckle filtering.
@@ -112,18 +112,13 @@ def generate_synthetic_sar(
         Channel 0 = VV polarization, Channel 1 = VH polarization.
     """
     try:
-        h, w = label_map.shape
-        sar = np.zeros((2, h, w), dtype=np.float32)
+        num_profiles = SAR_PROFILES.shape[0]
+        # Keep labels in the valid range for profile indexing
+        safe_labels = np.clip(label_map, 0, num_profiles - 1)
+        sar_base = SAR_PROFILES[safe_labels]  # Shape: (H, W, 2)
+        sar = sar_base.transpose(2, 0, 1).copy()  # Shape: (2, H, W)
 
-        for cls_id in range(SAR_PROFILES.shape[0]):
-            mask = label_map == cls_id
-            if not mask.any():
-                continue
-            for band_idx in range(2):
-                base_val = SAR_PROFILES[cls_id, band_idx]
-                sar[band_idx][mask] = base_val
-
-        noise = rng.normal(0, 0.02, size=(2, h, w)).astype(np.float32)
+        noise = rng.normal(0, 0.02, size=sar.shape).astype(np.float32)
         sar += noise
 
         sar = apply_lee_filter_multichannel(sar, window_size=3)

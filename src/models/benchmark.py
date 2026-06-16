@@ -138,13 +138,37 @@ def run_benchmark(
             stats_path=stats_path,
         )
 
+        import os
+
+        # Use multiple background workers and pinned memory for GPU-accelerated training
+        has_gpu = torch.cuda.is_available()
+        num_workers = max(2, os.cpu_count() // 2) if has_gpu else 0
+        pin_memory = has_gpu
+
         train_loader = DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False
+            train_ds,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
         )
         val_loader = DataLoader(
-            val_ds, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False
+            val_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
         )
-        test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(num_workers > 0),
+        )
 
         total = class_counts.sum()
         freq = class_counts.astype(np.float64) / (total + 1e-8)
@@ -193,6 +217,7 @@ def run_benchmark(
         trainer = pl.Trainer(
             max_epochs=max_epochs,
             accelerator="auto",
+            precision="16-mixed" if has_gpu else "32-true",
             callbacks=[checkpoint_cb, early_stop_cb, lr_monitor],
             default_root_dir=str(out_dir),
             log_every_n_steps=5,
@@ -232,6 +257,8 @@ def run_benchmark(
             pipeline = importlib.import_module("run_pipeline")
             eval_model = pipeline.LandCoverModule.load_from_checkpoint(best_path, strict=False)
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        eval_model = eval_model.to(device)
         eval_model.eval()
         eval_model.freeze()
 
@@ -241,8 +268,9 @@ def run_benchmark(
 
         with torch.no_grad():
             for x, y in test_loader:
+                x = x.to(device)
                 logits = eval_model(x)
-                preds = logits.argmax(dim=1)
+                preds = logits.argmax(dim=1).cpu()
                 iou_metric.update(preds, y)
                 acc_metric.update(preds, y)
                 f1_metric.update(preds, y)

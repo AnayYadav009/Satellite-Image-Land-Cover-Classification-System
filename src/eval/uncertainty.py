@@ -55,9 +55,11 @@ def mc_dropout_uncertainty(
         model.train()
         all_probs = []
         num_classes = None
+        dev = next(model.parameters()).device
+        image_dev = image.to(dev)
         with torch.no_grad():
             for _ in range(n_passes):
-                logits = model(image)
+                logits = model(image_dev)
                 if num_classes is None:
                     num_classes = logits.shape[1]
                 probs = F.softmax(logits, dim=1)

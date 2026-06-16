@@ -84,7 +84,18 @@ except (ImportError, ModuleNotFoundError):
     from data.raster_utils import save_segmentation_geotiff, stitch_patches
     from training.augmentations import get_train_transforms, get_val_transforms
 
-CLASS_COLORS = ["#FF0000","#006400","#FFD700","#7CFC00","#D2B48C","#00CED1","#0000FF","#FFFFFF","#8B4513","#808080"]
+CLASS_COLORS = [
+    "#FF0000",
+    "#006400",
+    "#FFD700",
+    "#7CFC00",
+    "#D2B48C",
+    "#00CED1",
+    "#0000FF",
+    "#FFFFFF",
+    "#8B4513",
+    "#808080",
+]
 SEED = 42
 PATCH_SIZE = 256
 NUM_BANDS = 16
@@ -231,7 +242,7 @@ class LandCoverModule(pl.LightningModule):
         self.ce_loss = smp.losses.FocalLoss(
             mode="multiclass", alpha=0.25, gamma=2.0, ignore_index=9
         )
-        
+
         if class_weights is not None:
             valid_classes = [i for i, w in enumerate(class_weights) if w > 0.0 and i != 9]
             self.dice_loss = smp.losses.DiceLoss(
@@ -330,11 +341,27 @@ def phase_train(class_counts, data_dir, fusion=False):
         stats_path=stats_path,
     )
 
+    import os
+
+    has_gpu = torch.cuda.is_available()
+    num_workers = max(2, os.cpu_count() // 2) if has_gpu else 0
+    pin_memory = has_gpu
+
     train_loader = DataLoader(
-        train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0, pin_memory=False
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
     )
     val_loader = DataLoader(
-        val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0, pin_memory=False
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=(num_workers > 0),
     )
 
     total = class_counts.sum()
@@ -360,6 +387,7 @@ def phase_train(class_counts, data_dir, fusion=False):
     trainer = pl.Trainer(
         max_epochs=MAX_EPOCHS,
         accelerator="auto",
+        precision="16-mixed" if has_gpu else "32-true",
         callbacks=[checkpoint_cb, early_stop_cb, lr_monitor],
         default_root_dir=str(OUT_DIR),
         log_every_n_steps=5,
@@ -393,15 +421,17 @@ def phase_train(class_counts, data_dir, fusion=False):
 
 
 def load_model_for_inference(ckpt_path, model_name="unet", in_channels=NUM_BANDS):
-    """Load a trained model from checkpoint for inference."""
+    """Load a trained model from checkpoint for inference with strict shape matching."""
     if model_name == "segformer":
         try:
             from src.models.segformer_module import SegFormerModule
         except (ImportError, ModuleNotFoundError):
             from models.segformer_module import SegFormerModule
-        model = SegFormerModule.load_from_checkpoint(ckpt_path, num_bands=in_channels, strict=False)
+        model = SegFormerModule.load_from_checkpoint(ckpt_path, num_bands=in_channels, strict=True)
     else:
-        model = LandCoverModule.load_from_checkpoint(ckpt_path, in_channels=in_channels, strict=False)
+        model = LandCoverModule.load_from_checkpoint(
+            ckpt_path, in_channels=in_channels, strict=True
+        )
     model.eval()
     model.freeze()
     return model
@@ -429,10 +459,24 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
         data_dir / "test" / "labels",
         stats_path=stats_path,
     )
-    test_loader = DataLoader(test_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+
+    import os
+
+    has_gpu = torch.cuda.is_available()
+    num_workers = max(2, os.cpu_count() // 2) if has_gpu else 0
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=has_gpu,
+        persistent_workers=(num_workers > 0),
+    )
 
     _in_ch = NUM_BANDS_FUSION if fusion else NUM_BANDS
     model = load_model_for_inference(best_ckpt, model_name=model_name, in_channels=_in_ch)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
 
     iou_metric = JaccardIndex(task="multiclass", num_classes=NUM_CLASSES, average="none")
     acc_metric = Accuracy(task="multiclass", num_classes=NUM_CLASSES)
@@ -449,18 +493,20 @@ def phase_evaluate(best_ckpt, data_dir, fusion=False, model_name="unet"):
 
     with torch.no_grad():
         for x, y in test_loader:
+            x = x.to(device)
             logits = model(x)
-            preds = logits.argmax(dim=1)
-            iou_metric.update(preds, y)
-            acc_metric.update(preds, y)
-            f1_metric.update(preds, y)
-            for p, t in zip(preds.view(-1), y.view(-1)):
+            preds = logits.argmax(dim=1).cpu()
+            y_cpu = y.cpu()
+            iou_metric.update(preds, y_cpu)
+            acc_metric.update(preds, y_cpu)
+            f1_metric.update(preds, y_cpu)
+            for p, t in zip(preds.view(-1), y_cpu.view(-1)):
                 confusion[t, p] += 1
             all_preds.append(preds)
-            all_labels.append(y)
+            all_labels.append(y_cpu)
 
             for i in range(logits.shape[0]):
-                conf_map = compute_confidence_map(logits[i : i + 1])
+                conf_map = compute_confidence_map(logits[i : i + 1].cpu())
                 all_conf_means.append(conf_map.mean())
 
     per_class_iou = iou_metric.compute().numpy()
@@ -564,10 +610,12 @@ def _plot_sample_predictions(model, dataset, n_samples=4):
     if n_samples == 1:
         axes = axes[np.newaxis, :]
 
+    dev = next(model.parameters()).device
     for i in range(min(n_samples, len(dataset))):
         img, label = dataset[i]
         with torch.no_grad():
-            logits = model(img.unsqueeze(0))
+            img_dev = img.unsqueeze(0).to(dev)
+            logits = model(img_dev).cpu()
             pred = logits.argmax(dim=1).squeeze().numpy()
             conf_map = compute_confidence_map(logits)
 
@@ -628,6 +676,8 @@ def phase_postprocess(best_ckpt, data_dir, fusion=False, model_name="unet"):
 
     _in_ch = NUM_BANDS_FUSION if fusion else NUM_BANDS
     model = load_model_for_inference(best_ckpt, model_name=model_name, in_channels=_in_ch)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
 
     iou_raw = JaccardIndex(task="multiclass", num_classes=NUM_CLASSES, average="macro")
     iou_post = JaccardIndex(task="multiclass", num_classes=NUM_CLASSES, average="macro")
@@ -635,7 +685,8 @@ def phase_postprocess(best_ckpt, data_dir, fusion=False, model_name="unet"):
     selem = disk(2)
     for img, label in test_ds:
         with torch.no_grad():
-            pred_raw = model(img.unsqueeze(0)).argmax(dim=1).squeeze()
+            img_dev = img.unsqueeze(0).to(device)
+            pred_raw = model(img_dev).argmax(dim=1).squeeze().cpu()
 
         iou_raw.update(pred_raw.unsqueeze(0), label.unsqueeze(0))
 
@@ -674,6 +725,8 @@ def phase_stitch(best_ckpt, data_dir, fusion=False, model_name="unet"):
 
     _in_ch = NUM_BANDS_FUSION if fusion else NUM_BANDS
     model = load_model_for_inference(best_ckpt, model_name=model_name, in_channels=_in_ch)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
 
     if fusion:
         try:
@@ -694,7 +747,8 @@ def phase_stitch(best_ckpt, data_dir, fusion=False, model_name="unet"):
     for i in range(len(test_ds)):
         img, _ = test_ds[i]
         with torch.no_grad():
-            out = model(img.unsqueeze(0)).argmax(dim=1).squeeze().numpy()
+            img_dev = img.unsqueeze(0).to(device)
+            out = model(img_dev).argmax(dim=1).squeeze().cpu().numpy()
             preds.append(out)
 
     shape_file = data_dir / "test" / "scene_shape.npy"
@@ -777,13 +831,19 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
 
     _in_ch = NUM_BANDS_FUSION if fusion else NUM_BANDS
     model = load_model_for_inference(best_ckpt, model_name=model_name, in_channels=_in_ch)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
 
     stats = np.load(data_dir / "band_stats.npy")
     means = stats[0].astype(np.float32).reshape(-1, 1, 1)
     stds = stats[1].astype(np.float32).reshape(-1, 1, 1)
 
-    img_t1, label_t1 = (generate_patch(23.18, 77.41) if mode == "gee" else generate_patch(size=256, seed=1000))
-    img_t2, label_t2 = (generate_patch(23.25, 77.48) if mode == "gee" else generate_patch(size=256, seed=2000))
+    img_t1, label_t1 = (
+        generate_patch(23.18, 77.41) if mode == "gee" else generate_patch(size=256, seed=1000)
+    )
+    img_t2, label_t2 = (
+        generate_patch(23.25, 77.48) if mode == "gee" else generate_patch(size=256, seed=2000)
+    )
 
     if fusion:
         try:
@@ -802,9 +862,9 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
         else:
             img_norm = optical_norm
 
-        t = torch.from_numpy(img_norm).unsqueeze(0)
+        t = torch.from_numpy(img_norm).unsqueeze(0).to(device)
         with torch.no_grad():
-            logits = model(t)
+            logits = model(t).cpu()
             return logits.argmax(dim=1).squeeze().numpy()
 
     pred_t1 = predict(img_t1)
@@ -862,7 +922,9 @@ def phase_change_detection(best_ckpt, data_dir, mode="quickstart", fusion=False,
     axes[2].imshow(change_map, cmap="RdYlGn_r", vmin=0, vmax=1)
     axes[2].set_title(f"Change Map ({100 * changed_pixels / total_pixels:.1f}% changed)")
     axes[2].axis("off")
-    patches = [mpatches.Patch(color=CLASS_COLORS[i], label=CLASS_NAMES[i]) for i in range(NUM_CLASSES)]
+    patches = [
+        mpatches.Patch(color=CLASS_COLORS[i], label=CLASS_NAMES[i]) for i in range(NUM_CLASSES)
+    ]
     fig.legend(handles=patches, loc="lower center", ncol=5, fontsize=8)
     plt.tight_layout(rect=[0, 0.06, 1, 1])
     fig.savefig(MAP_DIR / "change_detection_maps.png", dpi=150)
@@ -907,7 +969,20 @@ def phase_timeseries(data_dir: Path):
                 save_ndvi_animation_frames,
             )
 
-        MONTH_NAMES = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+        MONTH_NAMES = [
+            "Jan",
+            "Feb",
+            "Mar",
+            "Apr",
+            "May",
+            "Jun",
+            "Jul",
+            "Aug",
+            "Sep",
+            "Oct",
+            "Nov",
+            "Dec",
+        ]
         TS_DIR = MAP_DIR / "timeseries"
         TS_DIR.mkdir(exist_ok=True)
 
@@ -1044,7 +1119,9 @@ def _save_fusion_comparison_plot(results, class_names):
             if isinstance(per_class, dict):
                 iou_values = [per_class.get(name, 0.0) * 100 for name in class_names]
             elif isinstance(per_class, (list, np.ndarray)):
-                iou_values = [per_class[i] * 100 if i < len(per_class) else 0.0 for i in range(n_classes)]
+                iou_values = [
+                    per_class[i] * 100 if i < len(per_class) else 0.0 for i in range(n_classes)
+                ]
             else:
                 iou_values = [0.0] * n_classes
 
@@ -1075,7 +1152,7 @@ def _save_fusion_comparison_plot(results, class_names):
         print(f"  Warning: Failed to save fusion comparison plot: {e}")
 
 
-def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
+def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir, model_name="unet"):
     """
     Demonstrates SAR recovery under simulated cloud cover.
 
@@ -1092,6 +1169,7 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
         best_ckpt_optical: Path to best optical-only model checkpoint.
         best_ckpt_fusion: Path to best fusion model checkpoint.
         data_dir: Path to the dataset directory.
+        model_name: Model architecture name ("unet" or "segformer").
     """
     print("\n" + "=" * 70)
     print("  PHASE F2 -> Cloud Recovery Simulation (SAR vs Optical)")
@@ -1114,17 +1192,16 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
             print("  Warning: Fusion checkpoint not found. Skipping cloud simulation.")
             return
 
-        model_optical = LandCoverModule.load_from_checkpoint(best_ckpt_optical, strict=False)
-        model_optical.eval()
-        model_optical.freeze()
-
-        model_fusion = LandCoverModule.load_from_checkpoint(
-            best_ckpt_fusion,
-            in_channels=NUM_BANDS_FUSION,
-            strict=False,
+        # Load optical and fusion models using standard shape-safe wrapper
+        model_optical = load_model_for_inference(
+            best_ckpt_optical, model_name=model_name, in_channels=NUM_BANDS
         )
-        model_fusion.eval()
-        model_fusion.freeze()
+        model_fusion = load_model_for_inference(
+            best_ckpt_fusion, model_name=model_name, in_channels=NUM_BANDS_FUSION
+        )
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model_optical = model_optical.to(device)
+        model_fusion = model_fusion.to(device)
 
         test_ds = LandCoverDataset(
             data_dir / "test" / "images",
@@ -1147,7 +1224,9 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
             label_np = label.numpy()
 
             with torch.no_grad():
-                pred_clean = model_optical(img.unsqueeze(0)).argmax(dim=1).squeeze().numpy()
+                pred_clean = (
+                    model_optical(img.unsqueeze(0).to(device)).argmax(dim=1).squeeze().cpu().numpy()
+                )
 
             clouded_img = img.clone()
             h, w = img.shape[1], img.shape[2]
@@ -1157,14 +1236,26 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
             clouded_img[:, cy : cy + cloud_size, cx : cx + cloud_size] = 0.0
 
             with torch.no_grad():
-                pred_clouded = (model_optical(clouded_img.unsqueeze(0)).argmax(dim=1).squeeze().numpy())
+                pred_clouded = (
+                    model_optical(clouded_img.unsqueeze(0).to(device))
+                    .argmax(dim=1)
+                    .squeeze()
+                    .cpu()
+                    .numpy()
+                )
 
             try:
                 sar = generate_sar_for_patch(label_np, seed=i + 10000)
                 sar_tensor = torch.from_numpy(sar).float()
                 fused_input = torch.cat([clouded_img, sar_tensor], dim=0)
                 with torch.no_grad():
-                    pred_fusion = (model_fusion(fused_input.unsqueeze(0)).argmax(dim=1).squeeze().numpy())
+                    pred_fusion = (
+                        model_fusion(fused_input.unsqueeze(0).to(device))
+                        .argmax(dim=1)
+                        .squeeze()
+                        .cpu()
+                        .numpy()
+                    )
             except Exception as e:
                 print(f"  Warning: Fusion prediction failed for patch {i}: {e}")
                 pred_fusion = pred_clouded
@@ -1201,7 +1292,9 @@ def phase_cloud_simulation(best_ckpt_optical, best_ckpt_fusion, data_dir):
             axes[i, 3].set_title(f"Fusion Pred\n(IoU: {iou_fusion * 100:.1f}%)")
             axes[i, 3].axis("off")
 
-        plt.suptitle("Cloud Recovery: Optical vs SAR+Optical Fusion", fontsize=14, fontweight="bold")
+        plt.suptitle(
+            "Cloud Recovery: Optical vs SAR+Optical Fusion", fontsize=14, fontweight="bold"
+        )
         plt.tight_layout(rect=[0, 0, 1, 0.96])
         fig_path = MAP_DIR / "cloud_recovery.png"
         fig.savefig(fig_path, dpi=150, bbox_inches="tight")
@@ -1259,17 +1352,24 @@ def main(mode="quickstart", model="unet", fusion=False, gee_project=None):
                 benchmark_results.append(result)
 
             save_benchmark_report(benchmark_results, CLASS_NAMES, REPORT_DIR, MAP_DIR)
-            best_ckpt = benchmark_results[0].get("best_ckpt", "")
+
+            # Select the best model (highest mean IoU) between UNet and SegFormer
+            best_model_idx = 0
+            if len(benchmark_results) > 1:
+                if benchmark_results[1]["mean_iou"] > benchmark_results[0]["mean_iou"]:
+                    best_model_idx = 1
+
+            best_ckpt = benchmark_results[best_model_idx].get("best_ckpt", "")
             if not best_ckpt:
                 raise RuntimeError("Benchmark did not produce a checkpoint.")
 
             metrics = {
-                "overall_accuracy": benchmark_results[0]["overall_accuracy"],
-                "mean_iou": benchmark_results[0]["mean_iou"],
-                "per_class_iou": benchmark_results[0]["per_class_iou"],
-                "per_class_f1": benchmark_results[0]["per_class_f1"],
+                "overall_accuracy": benchmark_results[best_model_idx]["overall_accuracy"],
+                "mean_iou": benchmark_results[best_model_idx]["mean_iou"],
+                "per_class_iou": benchmark_results[best_model_idx]["per_class_iou"],
+                "per_class_f1": benchmark_results[best_model_idx]["per_class_f1"],
             }
-            downstream_model_name = "unet"
+            downstream_model_name = benchmark_results[best_model_idx]["model"]
         except Exception as e:
             print(f"\n  ERROR: Benchmark mode failed: {e}")
             import traceback
@@ -1325,9 +1425,13 @@ def main(mode="quickstart", model="unet", fusion=False, gee_project=None):
         metrics = phase_evaluate(best_ckpt, data_dir, fusion=fusion, model_name="unet")
         downstream_model_name = "unet"
 
-    post_metrics = phase_postprocess(best_ckpt, data_dir, fusion=fusion, model_name=downstream_model_name)
+    post_metrics = phase_postprocess(
+        best_ckpt, data_dir, fusion=fusion, model_name=downstream_model_name
+    )
 
-    phase_change_detection(best_ckpt, data_dir, mode=mode, fusion=fusion, model_name=downstream_model_name)
+    phase_change_detection(
+        best_ckpt, data_dir, mode=mode, fusion=fusion, model_name=downstream_model_name
+    )
 
     phase_stitch(best_ckpt, data_dir, fusion=fusion, model_name=downstream_model_name)
 
@@ -1342,7 +1446,9 @@ def main(mode="quickstart", model="unet", fusion=False, gee_project=None):
                 main_result=(metrics if downstream_model_name == "segformer" else None),
             )
             if ckpt_optical and ckpt_fusion:
-                phase_cloud_simulation(ckpt_optical, ckpt_fusion, data_dir)
+                phase_cloud_simulation(
+                    ckpt_optical, ckpt_fusion, data_dir, model_name=downstream_model_name
+                )
             else:
                 print("  Skipping cloud simulation — fusion training did not produce checkpoints.")
         except Exception as e:

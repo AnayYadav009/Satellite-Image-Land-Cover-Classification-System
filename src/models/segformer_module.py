@@ -80,7 +80,21 @@ class SegFormerModule(pl.LightningModule):
                 "first-time model download."
             ) from e
 
-        old_proj = self.model.segformer.encoder.patch_embeddings[0].proj
+        # Dynamically find the first projection Conv2d layer in the model (compatible across all transformers versions)
+        proj_name = None
+        old_proj = None
+        for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.Conv2d) and module.in_channels == 3:
+                proj_name = name
+                old_proj = module
+                break
+
+        if old_proj is None:
+            raise RuntimeError(
+                "Could not find the input Conv2d projection layer in the SegFormer model. "
+                "Ensure you are loading a standard SegformerForSemanticSegmentation model."
+            )
+
         new_proj = torch.nn.Conv2d(
             num_bands,
             old_proj.out_channels,
@@ -91,7 +105,16 @@ class SegFormerModule(pl.LightningModule):
         torch.nn.init.kaiming_normal_(new_proj.weight, mode="fan_out")
         if new_proj.bias is not None:
             torch.nn.init.zeros_(new_proj.bias)
-        self.model.segformer.encoder.patch_embeddings[0].proj = new_proj
+
+        # Traverse and set the new projection layer on the parent module
+        parts = proj_name.split(".")
+        parent = self.model
+        for part in parts[:-1]:
+            if part.isdigit():
+                parent = parent[int(part)]
+            else:
+                parent = getattr(parent, part)
+        setattr(parent, parts[-1], new_proj)
 
         self.focal_loss = smp.losses.FocalLoss(
             mode="multiclass", alpha=0.25, gamma=2.0, ignore_index=9

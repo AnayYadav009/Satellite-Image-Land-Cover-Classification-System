@@ -59,16 +59,17 @@ def get_real_data_patch(lat, lon, size_px=256, scale=10):
     point = ee.Geometry.Point([lon, lat])
     region = point.buffer(size_px * scale / 2).bounds()
 
-    s2 = (
+    s2_col = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(region)
         .filterDate(DATE_START, DATE_END)
-        .sort("CLOUDY_PIXEL_PERCENTAGE")
-        .first()
     )
 
-    if s2 is None:
+    # Server-side validation of the collection size
+    if s2_col.size().getInfo() == 0:
         return None, None
+
+    s2 = s2_col.sort("CLOUDY_PIXEL_PERCENTAGE").first()
 
     img = s2.select(["B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8", "B8A", "B9", "B11", "B12"])
     ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
@@ -78,15 +79,17 @@ def get_real_data_patch(lat, lon, size_px=256, scale=10):
     img = img.addBands([ndvi, ndwi, ndbi, dummy])
 
     s2_date = ee.Date(s2.get("system:time_start"))
-    dw = (
+    dw_col = (
         ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
         .filterBounds(region)
         .filterDate(s2_date.advance(-5, "day"), s2_date.advance(5, "day"))
-        .first()
     )
 
-    if dw is None:
+    # Server-side validation of the Dynamic World labels collection
+    if dw_col.size().getInfo() == 0:
         return None, None
+
+    dw = dw_col.first()
     label = dw.select("label")
 
     try:
@@ -137,7 +140,13 @@ def download_bhopal_dataset(
         raise RuntimeError("Earth Engine initialization failed.")
 
     out = Path(output_dir)
-    if out.exists() and (out / "band_stats.npy").exists():
+    train_img_dir = out / "train" / "images"
+    if (
+        out.exists()
+        and (out / "band_stats.npy").exists()
+        and train_img_dir.exists()
+        and list(train_img_dir.glob("*.npy"))
+    ):
         print(f"  [INFO] Data already exists in {out}. Skipping download.")
         return
 
