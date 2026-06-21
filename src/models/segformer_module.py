@@ -40,7 +40,7 @@ class SegFormerModule(pl.LightningModule):
     Output: (B, num_classes, H, W) logits upsampled to full resolution.
     """
 
-    def __init__(self, num_classes, num_bands, lr=5e-4, class_weights=None):
+    def __init__(self, num_classes, num_bands, lr=5e-4, class_weights=None, backbone="nvidia/mit-b0"):
         """Initialize SegFormer module.
 
         Args:
@@ -48,6 +48,7 @@ class SegFormerModule(pl.LightningModule):
             num_bands: Number of input spectral bands.
             lr: Learning rate for AdamW optimizer.
             class_weights: Optional per-class weight array for loss weighting.
+            backbone: Pretrained SegFormer backbone name (e.g. nvidia/mit-b0, nvidia/mit-b2).
         """
         super().__init__()
         weights_list = (
@@ -64,18 +65,18 @@ class SegFormerModule(pl.LightningModule):
 
         try:
             config = SegformerConfig.from_pretrained(
-                "nvidia/mit-b0",
+                backbone,
                 num_labels=num_classes,
                 ignore_mismatched_sizes=True,
             )
             self.model = SegformerForSemanticSegmentation.from_pretrained(
-                "nvidia/mit-b0",
+                backbone,
                 config=config,
                 ignore_mismatched_sizes=True,
             )
         except Exception as e:
             raise RuntimeError(
-                f"Failed to load SegFormer pretrained model 'nvidia/mit-b0': {e}. "
+                f"Failed to load SegFormer pretrained model '{backbone}': {e}. "
                 "Ensure 'transformers' is installed and you have internet access for "
                 "first-time model download."
             ) from e

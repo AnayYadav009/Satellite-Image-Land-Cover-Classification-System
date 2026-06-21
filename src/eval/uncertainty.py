@@ -53,19 +53,21 @@ def mc_dropout_uncertainty(
     """
     try:
         model.train()
-        all_probs = []
-        num_classes = None
         dev = next(model.parameters()).device
         image_dev = image.to(dev)
+        
+        # Vectorize by expanding along the batch dimension
+        # image has shape (1, C, H, W) -> expand to (n_passes, C, H, W)
+        image_expanded = image_dev.expand(n_passes, -1, -1, -1)
+        
         with torch.no_grad():
-            for _ in range(n_passes):
-                logits = model(image_dev)
-                if num_classes is None:
-                    num_classes = logits.shape[1]
-                probs = F.softmax(logits, dim=1)
-                all_probs.append(probs)
+            logits = model(image_expanded)
+            num_classes = logits.shape[1]
+            probs = F.softmax(logits, dim=1)
+            
+            # Compute mean probabilities across stochastic passes
+            mean_probs = probs.mean(dim=0, keepdim=True)
 
-        mean_probs = torch.stack(all_probs).mean(dim=0)
         mean_pred = mean_probs.argmax(dim=1).squeeze().cpu().numpy()
 
         entropy = -torch.sum(mean_probs * torch.log(mean_probs + 1e-8), dim=1).squeeze()

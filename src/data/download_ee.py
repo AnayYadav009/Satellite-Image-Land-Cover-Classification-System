@@ -44,6 +44,28 @@ def initialize_ee(project_id=None):
         return False
 
 
+def retry_ee(max_retries=5, initial_backoff=1.0, backoff_factor=2.0):
+    """Exponential backoff decorator for Google Earth Engine queries."""
+    import time
+    import random
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            backoff = initial_backoff
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        raise e
+                    sleep_time = backoff + random.uniform(0, 0.5)
+                    print(f"      [EE Retry] Attempt {attempt+1}/{max_retries} failed due to: {e}. Retrying in {sleep_time:.2f}s...")
+                    time.sleep(sleep_time)
+                    backoff *= backoff_factor
+        return wrapper
+    return decorator
+
+
+@retry_ee(max_retries=5)
 def get_real_data_patch(lat, lon, size_px=256, scale=10):
     """Fetch a single multispectral patch and label from GEE.
 

@@ -7,6 +7,7 @@ backscatter from label maps and a stub for real GEE-based Sentinel-1 download.
 
 import numpy as np
 
+from .download_ee import retry_ee
 from .sar_preprocess import (
     compute_sar_indices,
     generate_synthetic_sar,
@@ -43,6 +44,7 @@ def generate_sar_for_patch(
         return np.zeros((3, h, w), dtype=np.float32)
 
 
+@retry_ee(max_retries=5)
 def download_sentinel1_patch(
     lat: float,
     lon: float,

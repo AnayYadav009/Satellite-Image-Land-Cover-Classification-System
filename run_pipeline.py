@@ -21,8 +21,6 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-import numpy as np
-
 try:
     import torch.serialization
 
@@ -309,15 +307,28 @@ class LandCoverModule(pl.LightningModule):
         return loss
 
 
-def phase_train(class_counts, data_dir, fusion=False):
-    """Phase 2: Train a UNet model with the given class distribution."""
+def phase_train(class_counts, data_dir, fusion=False, model_name="unet"):
+    """Phase 2: Train a segmentation model with the given class distribution."""
     print("\n" + "=" * 70)
-    print(f"  PHASE 2 -> Training Baseline UNet ({ENCODER.capitalize()} encoder)")
+    model_title = (
+        model_name.upper()
+        if model_name != "unet"
+        else f"Baseline UNet ({ENCODER.capitalize()} encoder)"
+    )
+    print(f"  PHASE 2 -> Training {model_title}")
     print("=" * 70)
     seed_everything()
     stats_path = data_dir / "band_stats.npy"
 
-    if fusion:
+    if model_name == "cross_attention_unet":
+        try:
+            from src.data.fusion_dataset import FusionDataset
+        except (ImportError, ModuleNotFoundError):
+            from data.fusion_dataset import FusionDataset
+        DatasetClass = FusionDataset
+        in_channels = NUM_BANDS_FUSION
+        fusion = True
+    elif fusion:
         try:
             from src.data.fusion_dataset import FusionDataset
         except (ImportError, ModuleNotFoundError):
@@ -371,11 +382,26 @@ def phase_train(class_counts, data_dir, fusion=False):
     weights = np.clip(weights / (weights[weights > 0].mean() + 1e-8), 0.2, 3.0).astype(np.float32)
     print(f"  Class weights: {np.round(weights, 2).tolist()}")
 
-    model = LandCoverModule(class_weights=weights, in_channels=in_channels)
+    if model_name == "cross_attention_unet":
+        try:
+            from src.models.attention_fusion import CrossAttentionUNet
+        except (ImportError, ModuleNotFoundError):
+            from models.attention_fusion import CrossAttentionUNet
+        model = CrossAttentionUNet(
+            num_classes=NUM_CLASSES,
+            num_opt_bands=NUM_BANDS,
+            num_sar_bands=3,
+            class_weights=weights,
+            lr=LR,
+        )
+        ckpt_filename = "best-attention-unet-{epoch:02d}-{val_acc:.3f}"
+    else:
+        model = LandCoverModule(class_weights=weights, in_channels=in_channels)
+        ckpt_filename = "best-unet-{epoch:02d}-{val_acc:.3f}"
 
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(CKPT_DIR),
-        filename="best-unet-{epoch:02d}-{val_acc:.3f}",
+        filename=ckpt_filename,
         monitor="val_acc",
         mode="max",
         save_top_k=1,
@@ -428,6 +454,18 @@ def load_model_for_inference(ckpt_path, model_name="unet", in_channels=NUM_BANDS
         except (ImportError, ModuleNotFoundError):
             from models.segformer_module import SegFormerModule
         model = SegFormerModule.load_from_checkpoint(ckpt_path, num_bands=in_channels, strict=True)
+    elif model_name == "cross_attention_unet":
+        try:
+            from src.models.attention_fusion import CrossAttentionUNet
+        except (ImportError, ModuleNotFoundError):
+            from models.attention_fusion import CrossAttentionUNet
+        model = CrossAttentionUNet.load_from_checkpoint(
+            ckpt_path,
+            num_classes=NUM_CLASSES,
+            num_opt_bands=NUM_BANDS,
+            num_sar_bands=3,
+            strict=True,
+        )
     else:
         model = LandCoverModule.load_from_checkpoint(
             ckpt_path, in_channels=in_channels, strict=True
@@ -1033,6 +1071,7 @@ def phase_fusion_comparison(class_counts, data_dir, model_name="unet", main_resu
 
         results = []
         if main_result:
+            main_result["model"] = f"Baseline {model_name.upper()}"
             results.append(main_result)
 
         best_ckpts = {}
@@ -1376,7 +1415,7 @@ def main(mode="quickstart", model="unet", fusion=False, gee_project=None):
 
             traceback.print_exc()
             print("  Falling back to UNet-only training...")
-            best_ckpt = phase_train(class_counts, data_dir, fusion=fusion)
+            best_ckpt = phase_train(class_counts, data_dir, fusion=fusion, model_name="unet")
             metrics = phase_evaluate(best_ckpt, data_dir, fusion=fusion, model_name="unet")
             downstream_model_name = "unet"
 
@@ -1416,12 +1455,21 @@ def main(mode="quickstart", model="unet", fusion=False, gee_project=None):
 
             traceback.print_exc()
             print("  Falling back to UNet-only training...")
-            best_ckpt = phase_train(class_counts, data_dir, fusion=fusion)
+            best_ckpt = phase_train(class_counts, data_dir, fusion=fusion, model_name="unet")
             metrics = phase_evaluate(best_ckpt, data_dir, fusion=fusion, model_name="unet")
             downstream_model_name = "unet"
 
+    elif model == "cross_attention_unet":
+        fusion = True
+        best_ckpt = phase_train(
+            class_counts, data_dir, fusion=True, model_name="cross_attention_unet"
+        )
+        metrics = phase_evaluate(
+            best_ckpt, data_dir, fusion=True, model_name="cross_attention_unet"
+        )
+        downstream_model_name = "cross_attention_unet"
     else:
-        best_ckpt = phase_train(class_counts, data_dir, fusion=fusion)
+        best_ckpt = phase_train(class_counts, data_dir, fusion=fusion, model_name="unet")
         metrics = phase_evaluate(best_ckpt, data_dir, fusion=fusion, model_name="unet")
         downstream_model_name = "unet"
 
@@ -1454,6 +1502,35 @@ def main(mode="quickstart", model="unet", fusion=False, gee_project=None):
         except Exception as e:
             print(f"  Warning: SAR Fusion phases failed: {e}")
 
+    # Downstream Analytics & Reports
+    try:
+        from src.analysis.timeseries_trends import analyze_ndvi_trends
+    except (ImportError, ModuleNotFoundError):
+        from analysis.timeseries_trends import analyze_ndvi_trends
+    try:
+        analyze_ndvi_trends(
+            series_path=str(REPORT_DIR / "ndvi_series.npy"),
+            output_png=str(MAP_DIR / "ndvi_trends.png"),
+            output_json=str(REPORT_DIR / "ndvi_trends.json"),
+        )
+    except Exception as e:
+        print(f"  Warning: NDVI trend analysis failed: {e}")
+
+    try:
+        from src.vis.report_exporter import generate_reports
+    except (ImportError, ModuleNotFoundError):
+        from vis.report_exporter import generate_reports
+    try:
+        generate_reports(
+            metrics_path=str(REPORT_DIR / "metrics.json"),
+            trans_path=str(REPORT_DIR / "transition_area_ha.csv"),
+            ndvi_path=str(REPORT_DIR / "ndvi_stats.json"),
+            output_pdf=str(REPORT_DIR / "classification_report.pdf"),
+            output_md=str(REPORT_DIR / "project_summary_report.md"),
+        )
+    except Exception as e:
+        print(f"  Warning: Report generation failed: {e}")
+
     elapsed = time.time() - t_start
     print("\n" + "=" * 70)
     print("  PIPELINE COMPLETE                                              ")
@@ -1468,8 +1545,11 @@ def main(mode="quickstart", model="unet", fusion=False, gee_project=None):
     print(f"    {str(MAP_DIR / 'confusion_matrix.png'):<65s}")
     print(f"    {str(MAP_DIR / 'change_detection_maps.png'):<65s}")
     print(f"    {str(MAP_DIR / 'transition_matrix.png'):<65s}")
+    print(f"    {str(MAP_DIR / 'ndvi_trends.png'):<65s}")
     print(f"    {str(REPORT_DIR / 'metrics.json'):<65s}")
-    print(f"    {str(REPORT_DIR / 'transition_matrix.csv'):<65s}")
+    print(f"    {str(REPORT_DIR / 'transition_area_ha.csv'):<65s}")
+    print(f"    {str(REPORT_DIR / 'classification_report.pdf'):<65s}")
+    print(f"    {str(REPORT_DIR / 'project_summary_report.md'):<65s}")
     print("=" * 70)
 
 
@@ -1482,7 +1562,7 @@ if __name__ == "__main__":
         "--model",
         type=str,
         default="unet",
-        choices=["unet", "segformer", "both"],
+        choices=["unet", "segformer", "both", "cross_attention_unet"],
         help="Model architecture to train/evaluate",
     )
     parser.add_argument(
@@ -1494,5 +1574,32 @@ if __name__ == "__main__":
     parser.add_argument(
         "--gee_project", type=str, default=None, help="Google Cloud Project ID for Earth Engine"
     )
+    parser.add_argument(
+        "--train_ssl",
+        action="store_true",
+        default=False,
+        help="Train SimCLR self-supervised encoder before main segmentation model",
+    )
+    parser.add_argument(
+        "--train_translator",
+        action="store_true",
+        default=False,
+        help="Train Pix2Pix SAR-to-Optical translator",
+    )
     args = parser.parse_args()
+
+    if args.train_ssl:
+        try:
+            from src.models.train_ssl import main as ssl_main
+        except (ImportError, ModuleNotFoundError):
+            from models.train_ssl import main as ssl_main
+        ssl_main()
+
+    if args.train_translator:
+        try:
+            from src.models.sar_translator import train_translator
+        except (ImportError, ModuleNotFoundError):
+            from models.sar_translator import train_translator
+        train_translator()
+
     main(mode=args.mode, model=args.model, fusion=args.fusion, gee_project=args.gee_project)
